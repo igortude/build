@@ -1,0 +1,3285 @@
+import sys
+import os
+from PySide6.QtWidgets import QApplication, QMainWindow, QTableWidgetItem, QGraphicsOpacityEffect, QHeaderView, QFileDialog, QTabWidget, QPushButton, QWidget, QMessageBox, QTableWidget, QComboBox, QLabel, QCalendarWidget 
+from PySide6.QtCore import QPropertyAnimation, Qt, QDate, QLocale, QTime, QPoint
+from PySide6.QtGui import QPixmap, QColor, QFont, QIcon
+from PySide6 import QtWidgets, QtCore, QtGui
+from ui_interface import Ui_MainWindow
+from database import conectar_banco, listar_alunos
+from agendamentos import AgendamentosWindow, ConfirmacaoAgendamentoDialog
+from detalhes_usuario import DetalhesUsuario
+from historico import Historico
+import database
+from backup import encerrar_com_backup
+import shutil
+from custom import CustomWindow
+from db_lock import criar_lock, conectar_banco, upload_db_to_dropbox
+from dpbx import obter_cliente_dropbox
+import icons_rc
+
+DB_DROPBOX_PATH = "/nolimits_DB.db"
+LOCK_DROPBOX_PATH = "/lock.txt"
+LOCAL_DB_PATH = os.path.join(os.path.dirname(__file__), "nolimits_DB_local.db")
+
+
+class MainWindow(QMainWindow, Ui_MainWindow):
+    cadastro_realizado = QtCore.Signal()
+    aluno_adicionado = QtCore.Signal(str)
+    aluno_removido = QtCore.Signal(str, str, str)
+    
+    def __init__(self, dbx, local_db_path, nome_usuario="", parent=None):
+        super().__init__(parent)
+        self.setupUi(self)
+
+        icon_path = "icons/soft.ico"
+        icon = QIcon(icon_path)
+        self.setWindowIcon(icon)
+        self.dbx = dbx
+        self.local_db_path = local_db_path
+
+        if not os.path.exists("temp"):
+            os.makedirs("temp")
+
+        self.btn_selectFoto = QPushButton("Selecionar Foto", self)
+     #   self.btn_sendFoto = QPushButton("Enviar Foto", self)
+        self.foto_selecionada = None 
+        
+        self.setupUi(self)
+
+
+        self.custom_window = CustomWindow()
+        self.custom_window.style_changed.connect(self.apply_styles)
+
+        self.usuario_conectado.setText(nome_usuario)
+        self.modo_edicao = criar_lock()
+        if not self.modo_edicao:
+            print("Não foi possível entrar em modo edição. Modo somente leitura ativado.")
+        self.conn = database.conectar_banco(local_db_path, modo_edicao=False)
+        self.cursor = self.conn.cursor()
+
+        # Verificar tipo de usuário
+        try:
+            self.cursor.execute("SELECT tipo_usuario FROM usuarios WHERE nome = ?", (nome_usuario.strip(),))
+            resultado = self.cursor.fetchone()
+            self.btn_db.setEnabled(False)
+            if resultado and "Administrador" in resultado[0]:
+                self.btn_db.setEnabled(True)
+            else:
+                print("Botão btn_db permanece desativado")
+        except Exception as e:
+            print(f"Erro ao verificar tipo de usuário: {str(e)}")
+            self.btn_db.setEnabled(False)
+
+            # Conexão com o banco de dados
+        self.conn = conectar_banco(local_db_path, modo_edicao=self.modo_edicao)
+        if self.conn is None:
+            print("Erro: Falha ao conectar ao banco de dados.")
+        else:
+            self.cursor = self.conn.cursor()
+         #   print("Cursor criado com sucesso.")
+
+        self.carregar_agendamentos_na_interface()
+
+        self.historico = Historico("db/nolimits_DB.db")
+        self.configurar_tabela_historico()
+        self.aluno_removido.connect(self.remover_aluno_da_tabela)
+
+        self.carregar_funcionarios()
+        self.carregar_alunos()
+
+        self.setWindowTitle("CENTRO DE TREINAMENTO - NO LIMITS")
+       # self.janela_agendamentos.aluno_adicionado.connect(self.adicionar_aluno_na_mainwindow)
+        self.janela_agendamentos = None
+        self.calendarWidget.clicked.connect(self.abrir_agendamento)
+        self.setup_db_control()
+        
+        self.btn_selectFoto.clicked.connect(lambda: self.selecionar_arquivo(tipo="foto"))
+       # self.btn_sendFoto.clicked.connect(self.enviar_foto_usuario)
+        self.btn_selecionarAnexo.clicked.connect(lambda: self.selecionar_arquivo(tipo="anexo"))
+        self.btn_salvarAnexo.clicked.connect(self.enviar_anexo)
+        self.btn_cadastrarDB.clicked.connect(self.cadastrar_usuario)
+
+        self.effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self.effect)
+
+        self.fade_animation = QPropertyAnimation(self.effect, b"opacity")
+        self.fade_animation.setDuration(500)  
+        self.fade_animation.setStartValue(0) 
+        self.fade_animation.setEndValue(1)    
+        self.fade_animation.start()
+
+        self.btn_home.clicked.connect(lambda: self.mudar_pagina(self.pg_principal, self.btn_home))
+        self.btn_agenda.clicked.connect(lambda: self.mudar_pagina(self.pg_agenda, self.btn_agenda))
+        self.btn_usuarios.clicked.connect(lambda: self.mudar_pagina(self.pg_usuarios, self.btn_usuarios))
+        self.btn_cadastrar.clicked.connect(lambda: self.mudar_pagina(self.pg_cadastrar, self.btn_cadastrar))
+        self.btn_historico.clicked.connect(lambda: self.mudar_pagina(self.pg_historico, self.btn_historico))
+        self.btn_financeiro.clicked.connect(lambda: self.mudar_pagina(self.pg_financeiro, self.btn_financeiro))
+        self.btn_exportar.clicked.connect(lambda: self.mudar_pagina(self.pg_exportar, self.btn_exportar))
+        self.btn_user.clicked.connect(self.mostrar_detalhes_usuario)
+
+        self.btn_db.clicked.connect(self.mudar_para_db_main)
+        self.btn_cadastrar_user.clicked.connect(self.mudar_para_db_usuario)
+        self.btn_cadastrar_user.clicked.connect(self.db_pgs.setCurrentWidget(self.db_usuario))
+        self.btn_financas_db.clicked.connect(self.mudar_para_db_financas)
+        self.btn_banco.clicked.connect(self.mudar_para_db_control)
+        self.btn_salvar_escala.clicked.connect(lambda: self.salvar_escala())
+        self.btn_carregarEscala.clicked.connect(lambda: self.carregar_escala())
+        self.btn_salvar_to_db.clicked.connect(self.salvar_no_banco)
+        self.btn_exportarPDF.clicked.connect(self.exportar_pdf)
+        self.btn_backupDB.clicked.connect(self.bkpDB)
+        self.btn_wipeDB.clicked.connect(self.abrir_janela_limpeza)
+
+        self.preencher_comboBox()
+        self.preencher_cmb_NIVEL()
+        self.preencher_cmb_PLAN()
+        self.preencher_cmb_PLANO()
+        self.carregar_registros()
+        self.conectar_botoes()
+        self.conectar_botoes_salvar()
+        self.carregar_dados_do_db()
+        self.carregar_alunos_na_lista()
+        self.configurar_tabelas_agenda()
+        self.listWidget.itemDoubleClicked.connect(self.mostrar_dados_aluno)
+        self.listAnexos.itemDoubleClicked.connect(self.abrir_anexo_selecionado)
+        self.btn_salvarComentario.clicked.connect(self.salvar_observacoes)
+        self.btn_limparComentario.clicked.connect(self.limpar_observacoes)
+        self.cadastro_realizado.connect(self.preencher_cmb_PLAN)
+        self.configurar_tabela_financas()
+        self.configurar_table_financeiro()
+        self.table_historico.cellDoubleClicked.connect(self.redirecionar_e_selecionar_aluno)
+        self.listWidget.currentItemChanged.connect(self.atualizar_grafico)
+        self.btn_usuarios.clicked.connect(lambda: self.atualizar_grafico())
+
+    def abrir_janela_agendamento(self):
+        """Slot que processa o sinal de abertura da janela de agendamento."""
+        # Recuperar os dados da AgendamentosWindow
+        nome = self.agendamentos_window.cmbAluno.currentText()
+        horario = self.agendamentos_window.horario_input.time().toString("hh:mm")
+        data_selecionada = self.agendamentos_window.data_selecionada  # Ajuste conforme necessário
+
+        # Validar os campos
+        if not nome or not horario:
+            QtWidgets.QMessageBox.warning(self, "Erro", "Preencha o nome e o horário!")
+            return
+
+        # Buscar os dados completos do aluno
+        aluno_completo = next((a for a in listar_alunos() if a[1] == nome), None)
+        if aluno_completo:
+            # Extrair nome e foto_binaria corretamente
+            _, nome, foto_binaria = aluno_completo  # Ajuste conforme a estrutura de aluno_completo
+
+            # Abrir a janela de confirmação
+            dialog = ConfirmacaoAgendamentoDialog(nome, horario, foto_binaria, data_selecionada, self)
+            
+            # Preencher os ComboBoxes da janela de confirmação
+            self.agendamentos_window.preencher_cmbPrescricao(dialog.cmbPrescricao)
+            self.agendamentos_window.preencher_cmbOBS(dialog.cmbOBS)
+
+            if dialog.exec():  # Se o usuário confirmar
+                prescricao = dialog.cmbPrescricao.currentText()
+                observacao = dialog.cmbOBS.currentText()
+                # Adicionar à QTabWidget via AgendamentosWindow
+                self.agendamentos_window.adicionar_aluno_na_tabela(data_selecionada, nome, horario, prescricao, observacao)
+                # Salvar e atualizar (se necessário)
+                self.agendamentos_window.salvar_agendamentos()
+                self.agendamentos_window.atualizar_agendamentos()
+        else:
+            QtWidgets.QMessageBox.warning(self, "Erro", "Aluno não encontrado!")
+
+
+    def importar_agendamentos(self):
+        import csv
+        agendamentos = {}
+        try:
+            # Importação do CSV local
+            try:
+                with open("midia/agendamento.csv", mode="r", newline="", encoding="utf-8") as file:
+                    reader = csv.reader(file)
+                    try:
+                        header = next(reader)  # Pula o cabeçalho
+                        if header != ["aluno", "prescricao", "observacao", "data", "hora"]:
+                            print("Cabeçalho inválido no arquivo CSV. Usando estrutura padrão.")
+                    except StopIteration:
+                        pass  # Arquivo vazio
+
+                    for row in reader:
+                        if len(row) == 5:
+                            aluno, prescricao, observacao, data, horario = row
+                            aluno_data = {"nome": aluno, "prescricao": prescricao, "observacao": observacao}
+                            if data not in agendamentos:
+                                agendamentos[data] = {}
+                            if horario not in agendamentos[data]:
+                                agendamentos[data][horario] = []
+                            agendamentos[data][horario].append(aluno_data)
+                        else:
+                            print(f"Linha ignorada por formato inválido: {row}")
+            except FileNotFoundError:
+                print("Arquivo CSV não encontrado. Continuando com os dados do banco de dados.")
+
+            # Importação do banco de dados
+            try:
+                self.cursor.execute("""
+                    SELECT aluno, prescricao, observacao, dia, turno FROM dados_semana
+                """)
+                registros_db = self.cursor.fetchall()
+
+                for aluno, prescricao, observacao, dia, turno in registros_db:
+                    horario = "06:00" if turno == "Manhã" else "12:00"
+                    aluno_data = {"nome": aluno, "prescricao": prescricao, "observacao": observacao}
+                    if dia not in agendamentos:
+                        agendamentos[dia] = {}
+                    if horario not in agendamentos[dia]:
+                        agendamentos[dia][horario] = []
+                    agendamentos[dia][horario].append(aluno_data)
+            except Exception as e:
+                print(f"Erro ao importar dados do banco de dados: {str(e)}")
+
+        except Exception as e:
+            print(f"Erro geral ao importar agendamentos: {str(e)}")
+
+        return agendamentos
+    
+    def carregar_agendamentos_na_interface(self):
+        try:
+            if not hasattr(self, 'cursor') or self.cursor is None:
+                self.conn = database.conectar_banco(self.local_db_path, modo_edicao=False)
+                self.cursor = self.conn.cursor()
+
+            self.cursor.execute("""
+                SELECT aluno, prescricao, observacao, dia, turno, check_in FROM dados_semana
+            """)
+            agendamentos = self.cursor.fetchall()
+
+            print("Agendamentos carregados do banco:")
+            for aluno, prescricao, observacao, dia, turno, check_in in agendamentos:
+                print(f"  Aluno={aluno}, Dia={dia}, Turno='{turno}', Check_in='{check_in}'")
+                self.adicionar_aluno_na_tabwidget(dia, turno, {
+                    "nome": aluno,
+                    "prescricao": prescricao,
+                    "observacao": observacao,
+                    "check_in": check_in or "Ausente"  # Garante "Ausente" se o valor for None
+                })
+        except Exception as e:
+            print(f"Erro ao carregar agendamentos na interface: {str(e)}")
+            QtWidgets.QMessageBox.critical(self, "Erro", f"Erro ao carregar agendamentos: {str(e)}")
+
+    def adicionar_aluno_na_tabwidget(self, dia_str, horario, dados_aluno):
+        dia_map = {
+            "segunda-feira": 0, "terça-feira": 1, "quarta-feira": 2,
+            "quinta-feira": 3, "sexta-feira": 4, "sábado": 5
+        }
+        turno_map = {"manhã": 0, "tarde": 1}
+
+        tab_widget_principal = self.tabWidget
+        dia_str = str(dia_str).lower()
+        indice_dia = dia_map.get(dia_str, -1)
+        if indice_dia == -1:
+            print(f"Erro: Dia inválido '{dia_str}'")
+            return
+
+        dia_ativo = tab_widget_principal.widget(indice_dia)
+        if not dia_ativo:
+            print(f"Erro: Nenhum widget encontrado para o dia {dia_str}")
+            return
+
+        tab_turnos = dia_ativo.findChild(QtWidgets.QTabWidget)
+        if not tab_turnos:
+            print("Erro: Nenhum QTabWidget encontrado para turnos")
+            return
+
+        horario = str(horario).strip().lower()
+        turno_index = turno_map.get(horario, -1)
+        if turno_index == -1:
+            print(f"Erro: Turno inválido '{horario}'")
+            return
+
+        turno_ativo = tab_turnos.widget(turno_index)
+        tabela = turno_ativo.findChild(QtWidgets.QTableWidget)
+
+        # Configurar colunas para incluir Check-in
+        tabela.setColumnCount(4)  # Nome, Prescrição, Observação, Check-in
+        tabela.setHorizontalHeaderLabels(["Aluno", "Prescrição", "Observação", "Check-in"])
+
+        row_position = tabela.rowCount()
+        tabela.insertRow(row_position)
+        tabela.setItem(row_position, 0, QtWidgets.QTableWidgetItem(dados_aluno["nome"]))
+        tabela.setItem(row_position, 1, QtWidgets.QTableWidgetItem(dados_aluno.get("prescricao", "")))
+        tabela.setItem(row_position, 2, QtWidgets.QTableWidgetItem(dados_aluno.get("observacao", "")))
+        tabela.setItem(row_position, 3, QtWidgets.QTableWidgetItem(dados_aluno.get("check_in", "Ausente")))
+        print(f"Aluno {dados_aluno['nome']} adicionado ao dia {dia_str}, turno {horario}, check_in {dados_aluno.get('check_in', 'Ausente')}")
+
+
+    def apply_styles(self, bg_color, text_color, font):
+        print("apply_styles chamado com:", bg_color.name(), text_color.name(), font.family(), font.pointSize())
+        style = f"background-color: {bg_color.name()}; color: {text_color.name()}; font-family: {font.family()}; font-size: {font.pointSize()}px;"
+        self.main_content.setStyleSheet(style)
+        self.main_content.update()
+        print("Estilos aplicados ao main_content:", style)
+
+    def exportar_pdf(self):
+        from exportar_pdf import (
+    gerar_pdf_relatorio, gerar_pdf_financas, gerar_pdf_historico, gerar_pdf_escala, gerar_pdf_aluno, gerar_pdf_comunicado
+)
+        if self.rd_escalaPDF.isChecked():
+            gerar_pdf_escala()
+        elif self.rd_historicoPDF.isChecked():
+            gerar_pdf_historico()
+        elif self.rd_financeiroPDF.isChecked():
+            gerar_pdf_financas()
+        elif self.rd_documentoPDF.isChecked():
+            gerar_pdf_relatorio()
+        elif self.rd_alunoPDF.isChecked():
+            gerar_pdf_aluno()
+        elif self.rd_laudoPDF.isChecked():
+            gerar_pdf_comunicado()
+        else:
+            QMessageBox.warning(self, "Atenção", "Selecione uma opção para exportar!")
+
+    def mostrar_detalhes_usuario(self):
+        nome_usuario = self.usuario_conectado.text()
+        btn_pos = self.btn_user.mapToGlobal(QPoint(0, 0))
+        if not hasattr(self, 'detalhes_usuario') or self.detalhes_usuario is None:
+            self.detalhes_usuario = DetalhesUsuario(nome_usuario, self.custom_window)
+            self.detalhes_usuario.ui.show_window(btn_pos.x(), btn_pos.y())
+            self.detalhes_usuario.show()
+        else:
+            if self.detalhes_usuario.isVisible():
+                self.detalhes_usuario.hide()
+            else:
+                self.detalhes_usuario.setWindowOpacity(1.0)
+                self.detalhes_usuario.ui.show_window(btn_pos.x(), btn_pos.y())
+                self.detalhes_usuario.show()
+
+    def redirecionar_e_selecionar_aluno(self, row, column):
+        try:
+
+            nome_aluno = self.table_historico.item(row, 0).text()
+
+
+            self.paginas.setCurrentWidget(self.pg_usuarios)
+
+
+            for index in range(self.listWidget.count()):
+                if self.listWidget.item(index).text() == nome_aluno:
+                    self.listWidget.setCurrentRow(index)
+                    break
+
+
+            self.mostrar_dados_aluno(self.listWidget.currentItem())
+
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Erro ao redirecionar e selecionar aluno: {str(e)}")
+
+    def configurar_tabela_historico(self):
+
+        self.table_historico.setColumnCount(6)
+        self.table_historico.setHorizontalHeaderLabels([
+            "Aluno", "Planejamento", "Prescrição", 
+            "Frequência Semanal", "Frequência Mensal", "Frequência Anual"
+        ])
+
+
+        header = self.table_historico.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Stretch)
+
+
+        self.table_historico.setWordWrap(True)
+
+
+        font = QFont()
+        font.setPointSize(12)
+        self.table_historico.setFont(font)
+
+
+        self.table_historico.resizeRowsToContents()
+
+    def carregar_historico(self):
+        try:
+
+            dados_historico = self.historico.gerar_historico_completo()
+
+
+            self.table_historico.setRowCount(0)
+
+
+            for row, dado in enumerate(dados_historico):
+                self.table_historico.insertRow(row)
+
+
+                aluno_item = QTableWidgetItem(dado["Aluno"])
+                aluno_item.setTextAlignment(Qt.AlignCenter)
+                self.table_historico.setItem(row, 0, aluno_item)
+
+
+                planejamento_item = QTableWidgetItem(dado["Planejamento"])
+                planejamento_item.setTextAlignment(Qt.AlignCenter)
+                self.table_historico.setItem(row, 1, planejamento_item)
+
+
+                prescricao_item = QTableWidgetItem(dado["Prescricao"])
+                prescricao_item.setTextAlignment(Qt.AlignCenter)
+                self.table_historico.setItem(row, 2, prescricao_item)
+
+
+                frequencia_semanal = QTableWidgetItem(str(dado["Frequencia_Semanal"]))
+                frequencia_semanal.setTextAlignment(Qt.AlignCenter)
+                self.table_historico.setItem(row, 3, frequencia_semanal)
+
+
+                frequencia_mensal = QTableWidgetItem(str(dado["Frequencia_Mensal"]))
+                frequencia_mensal.setTextAlignment(Qt.AlignCenter)
+                self.table_historico.setItem(row, 4, frequencia_mensal)
+
+
+                frequencia_anual = QTableWidgetItem(str(dado["Frequencia_Anual"]))
+                frequencia_anual.setTextAlignment(Qt.AlignCenter)
+                self.table_historico.setItem(row, 5, frequencia_anual)
+
+
+            self.table_historico.resizeRowsToContents()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Erro ao carregar histórico: {str(e)}")
+
+    def closeEvent(self, event):
+        import os
+        import socket
+        import sys
+        from dropbox.exceptions import ApiError
+        import dropbox
+        from dpbx import obter_cliente_dropbox
+        from backup import encerrar_com_backup, LoadingDialog  # Importa o método e a classe do backup.py
+        from PySide6.QtWidgets import QApplication
+
+        """
+        Sobrescreve o evento de fechamento para sincronizar, enviar arquivos ao Dropbox,
+        remover o lock, remover o banco temporário e encerrar com backup.
+        """
+        # Criar e exibir o diálogo de carregamento
+        loading_dialog = LoadingDialog(self)
+        loading_dialog.label.setText("Iniciando processo de fechamento...")
+        loading_dialog.show()
+        QApplication.processEvents()
+
+        try:
+            # Inicializa o cliente Dropbox (assumindo que está em self.dbx)
+            dbx = self.dbx
+            if not dbx:
+                raise Exception("Falha ao conectar ao Dropbox")
+
+            # Caminho do banco de dados temporário
+            TEMP_DB_PATH = "nolimits_DB_local.db"  # Ajustado para o banco temporário correto
+
+            # Log para verificar o modo de edição
+            print(f"Modo edição: {self.modo_edicao}")
+
+            # Se está no modo de edição, sincroniza o banco
+            if self.modo_edicao:
+                # Commit das alterações no banco de dados, se a conexão estiver aberta
+                if hasattr(self, 'conn') and self.conn is not None:
+                    try:
+                        loading_dialog.label.setText("Commitando alterações no banco local...")
+                        QApplication.processEvents()
+                        self.conn.commit()
+                        print("Alterações commitadas no banco local.")
+                    except Exception as commit_error:
+                        print(f"Erro ao commitar alterações: {str(commit_error)}")
+
+                # Verificar se o lock ainda existe e pertence à instância atual
+                try:
+                    loading_dialog.label.setText("Verificando lock no Dropbox...")
+                    QApplication.processEvents()
+                    metadata = dbx.files_get_metadata(LOCK_DROPBOX_PATH)
+                    lock_content = dbx.files_download(LOCK_DROPBOX_PATH)[1].content.decode()
+                    current_instance = f"{socket.gethostname()} ({sys.platform})"
+                    print(f"Lock encontrado. Conteúdo: {lock_content}, Instância atual: {current_instance}")
+                    if current_instance not in lock_content:
+                        print("Lock não pertence a esta instância. Upload cancelado.")
+                        # Fecha a conexão com o banco antes de sair
+                        try:
+                            if self.conn is not None:
+                                self.conn.close()
+                                print("Conexão com o banco local fechada.")
+                                self.conn = None
+                        except Exception as e:
+                            print(f"Erro ao fechar conexão com o banco: {str(e)}")
+                        loading_dialog.close()
+                        event.accept()
+                        return
+                except ApiError as e:
+                    if e.error.is_path() and e.error.get_path().is_not_found():
+                        print("Lock não encontrado no Dropbox. Upload cancelado.")
+                        # Fecha a conexão com o banco antes de sair
+                        try:
+                            if self.conn is not None:
+                                self.conn.close()
+                                print("Conexão com o banco local fechada.")
+                                self.conn = None
+                        except Exception as e:
+                            print(f"Erro ao fechar conexão com o banco: {str(e)}")
+                        loading_dialog.close()
+                        event.accept()
+                        return
+                    else:
+                        print(f"Erro ao verificar lock no Dropbox: {str(e)}")
+                        raise
+
+                # 1. Sincroniza o banco de dados com o Dropbox
+                try:
+                    loading_dialog.label.setText("Sincronizando banco de dados com o Dropbox...")
+                    QApplication.processEvents()
+                    with open(self.local_db_path, "rb") as f:
+                        dbx.files_upload(
+                            f.read(),
+                            DB_DROPBOX_PATH,
+                            mode=dropbox.files.WriteMode("overwrite"),
+                            mute=False,
+                            autorename=False
+                        )
+                    print(f"Banco '{self.local_db_path}' sincronizado com o Dropbox em '{DB_DROPBOX_PATH}'.")
+                except ApiError as e:
+                    print(f"Erro ao sincronizar banco ao fechar: {str(e)}")
+                    raise
+                except Exception as e:
+                    print(f"Erro inesperado ao sincronizar banco: {str(e)}")
+                    raise
+
+                # 2. Encerra com backup
+                try:
+                    if hasattr(self, 'conn') and self.conn is not None and hasattr(self, 'cursor') and self.cursor is not None:
+                        loading_dialog.label.setText("Executando backup e limpeza (se for sábado)...")
+                        QApplication.processEvents()
+                        encerrar_com_backup(self, self.conn, self.cursor)  # Chama a função com os argumentos corretos
+                        print("Encerramento com backup concluído.")
+                    else:
+                        print("Conexão ou cursor não disponíveis. Pulando o backup.")
+                except Exception as e:
+                    print(f"Erro ao encerrar com backup (continuando o fechamento): {str(e)}")
+
+                # Remove o lock no Dropbox (se existir) após o upload
+                try:
+                    loading_dialog.label.setText("Removendo lock do Dropbox...")
+                    QApplication.processEvents()
+                    dbx.files_delete_v2(LOCK_DROPBOX_PATH)
+                    print("Lock removido do Dropbox.")
+                except ApiError as e:
+                    if not e.error.is_path_not_found():
+                        print(f"Erro ao remover lock: {str(e)}")
+                        raise
+
+            else:
+                print("Modo edição não ativado. Pulando sincronização do banco.")
+
+            # 3. Envia os arquivos .csv e .json para o Dropbox
+            try:
+                BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+                MEDIA_DIR = os.path.join(BASE_PATH, "midia")
+
+                if os.path.exists(MEDIA_DIR):
+                    files_to_upload = [
+                        os.path.join(MEDIA_DIR, f) for f in os.listdir(MEDIA_DIR)
+                        if f.endswith(".csv") or f.endswith(".json")
+                    ]
+
+                    if files_to_upload:
+                        loading_dialog.label.setText("Enviando arquivos .csv e .json para o Dropbox...")
+                        QApplication.processEvents()
+                        from upload_db_files import upload_db_files  # Importa aqui para evitar circularidade
+                        upload_db_files(dbx, files_to_upload, dropbox_base_path="/Aplicativos/NoLimitsFinal/")
+                        print("Arquivos .csv e .json enviados para o Dropbox.")
+                    else:
+                        print("Nenhum arquivo .csv ou .json encontrado no diretório 'midia/'.")
+                else:
+                    print("Diretório 'midia/' não encontrado. Nenhum arquivo enviado.")
+            except Exception as e:
+                print(f"Erro ao enviar arquivos ao Dropbox (continuando o fechamento): {str(e)}")
+
+            # 4. Fecha a conexão com o banco de dados (se ainda estiver aberta)
+            try:
+                if self.conn is not None:
+                    loading_dialog.label.setText("Fechando conexão com o banco de dados...")
+                    QApplication.processEvents()
+                    self.conn.close()
+                    print("Conexão com o banco local fechada.")
+                    self.conn = None  # Marca como fechada para evitar tentativas futuras
+            except Exception as e:
+                print(f"Erro ao fechar conexão com o banco: {str(e)}")
+
+            # 5. Remove o banco de dados temporário, se existir
+            try:
+                if os.path.exists(TEMP_DB_PATH):
+                    loading_dialog.label.setText("Removendo banco de dados temporário...")
+                    QApplication.processEvents()
+                    os.remove(TEMP_DB_PATH)
+                    print(f"Banco temporário '{TEMP_DB_PATH}' removido com sucesso.")
+                else:
+                    print(f"Banco temporário '{TEMP_DB_PATH}' não encontrado. Nenhuma ação necessária.")
+            except Exception as e:
+                print(f"Erro ao remover o banco temporário '{TEMP_DB_PATH}': {str(e)}")
+
+        except Exception as e:
+            print(f"Erro crítico no closeEvent: {str(e)}")
+            loading_dialog.close()
+            event.ignore()  # Impede o fechamento apenas se for um erro crítico
+            return
+
+        # 6. Finaliza o processo
+        loading_dialog.label.setText("Concluído! O programa será fechado.")
+        QApplication.processEvents()
+        # Pequena pausa para o usuário ler a mensagem final
+        import time
+        time.sleep(1)
+        loading_dialog.close()
+
+        # Garante que o programa feche, mesmo que ocorram erros não críticos
+        event.accept()
+        print("Programa fechado com sucesso.")
+
+
+    def remover_aluno_da_tabela(self, nome_aluno, data_str, horario):
+        from PySide6.QtWidgets import QMessageBox
+        from PySide6.QtCore import QDate, QTime
+        import sys
+        import database
+        import sqlite3
+        
+        print(f"Removendo aluno: {nome_aluno}, Data: {data_str}, Horário: {horario}")
+        if not nome_aluno:
+            print("Erro: Nome do aluno não pode estar vazio.")
+            return
+
+        data_qdate = QDate.fromString(data_str, "yyyy-MM-dd")
+        indice_dia = data_qdate.dayOfWeek() - 1
+        print(f"Índice do dia: {indice_dia}, Dia da semana: {data_qdate.toString('dddd')}")
+        if indice_dia < 0 or indice_dia > 5:
+            QMessageBox.warning(self, "Aviso", f"A data {data_str} não está na semana exibida na tabWidget (Segunda a Sábado).")
+            return
+
+        horario_qtime = QTime.fromString(horario, "hh:mm")
+        turno = "Manhã" if QTime(6, 0) <= horario_qtime <= QTime(12, 0) else "Tarde"
+        print(f"Turno calculado: {turno}")
+
+        tab_widget_principal = self.tabWidget
+        dia_ativo = tab_widget_principal.widget(indice_dia)
+        if not dia_ativo:
+            QMessageBox.warning(self, "Erro", f"Nenhuma página encontrada para o índice {indice_dia}.")
+            return
+
+        tab_turnos = dia_ativo.findChild(QtWidgets.QTabWidget)
+        if not tab_turnos:
+            QMessageBox.warning(self, "Erro", "Nenhum turno encontrado para o dia ativo.")
+            return
+
+        print(f"Abas de turno disponíveis: {[tab_turnos.tabText(i) for i in range(tab_turnos.count())]}")
+        turno_index = 0 if turno == "Manhã" else 1
+        turno_nome = tab_turnos.tabText(turno_index)
+        print(f"Turno encontrado na tab: {turno_nome}")
+
+        turno_ativo = tab_turnos.widget(turno_index)
+        if not turno_ativo:
+            QMessageBox.warning(self, "Erro", f"Turno {turno} não encontrado.")
+            return
+
+        tabela_turno = turno_ativo.findChild(QtWidgets.QTableWidget)
+        if not tabela_turno:
+            QMessageBox.warning(self, "Erro", f"Nenhuma tabela encontrada no turno {turno}.")
+            return
+
+        horario_normalizado = horario_qtime.toString("hh:mm")
+        print(f"Horário normalizado: {horario_normalizado}")
+
+        aluno_encontrado = False
+        for row in range(tabela_turno.rowCount()):
+            item_aluno = tabela_turno.item(row, 0)
+            aluno_text = item_aluno.text() if item_aluno else "None"
+            print(f"Verificando linha {row}: Aluno={aluno_text}")
+            if item_aluno and item_aluno.text() == nome_aluno:
+                aluno_encontrado = True
+                # Verificar se está em modo edição
+                if not self.modo_edicao:
+                    QMessageBox.warning(self, "Aviso", "Você está em modo somente leitura e não pode remover alunos.")
+                    return
+
+                # Remove da tabela visual
+                tabela_turno.removeRow(row)
+
+                # Remove do banco de dados
+                try:
+                    # Verificar se a conexão está disponível e aberta
+                    if not hasattr(self, 'conn') or self.conn is None:
+                        self.conn = database.conectar_banco(self.local_db_path, modo_edicao=self.modo_edicao)
+                        self.cursor = self.conn.cursor()
+                        print("Conexão reaberta para remoção.")
+                    elif self.conn.closed:  # Atributo 'closed' não existe diretamente, então usamos um try-except
+                        try:
+                            self.conn.execute("SELECT 1")
+                        except Exception:
+                            self.conn = database.conectar_banco(self.local_db_path, modo_edicao=self.modo_edicao)
+                            self.cursor = self.conn.cursor()
+                            print("Conexão reaberta para remoção (estava fechada).")
+
+                    cursor = self.cursor
+
+                    # Verificar se a conexão permite escrita
+                    try:
+                        cursor.execute("CREATE TABLE IF NOT EXISTS test_permissions (id INTEGER)")
+                        cursor.execute("INSERT INTO test_permissions (id) VALUES (1)")
+                        self.conn.commit()
+                        cursor.execute("DROP TABLE test_permissions")
+                        self.conn.commit()
+                        print("Conexão permite escrita, prosseguindo com a remoção.")
+                    except sqlite3.Error as e:
+                        print(f"Erro: Conexão não permite escrita: {e}")
+                        QMessageBox.critical(self, "Erro", "A conexão com o banco de dados não permite operações de escrita. O programa será encerrado.")
+                        sys.exit(1)
+
+                    nome_dia_ativo = tab_widget_principal.tabText(indice_dia)
+                    print(f"Executando DELETE para aluno: {nome_aluno}, dia: {nome_dia_ativo}, turno: {turno_nome}")
+                    cursor.execute('''
+                        DELETE FROM dados_semana
+                        WHERE aluno = ? AND dia = ? AND turno = ?
+                    ''', (nome_aluno, nome_dia_ativo, turno_nome))
+                    linhas_afetadas = cursor.rowcount
+                    print(f"Linhas afetadas pelo DELETE: {linhas_afetadas}")
+                    if linhas_afetadas == 0:
+                        print(f"Aviso: Nenhum registro encontrado no banco para {nome_aluno} no dia {nome_dia_ativo}, turno {turno_nome}.")
+                        QMessageBox.warning(self, "Aviso", f"Nenhum registro encontrado no banco para {nome_aluno} no dia {nome_dia_ativo}, turno {turno_nome}.")
+                        return
+
+                    self.conn.commit()
+
+                    print(f"Aluno {nome_aluno} removido do banco de dados para o dia {nome_dia_ativo}, turno {turno_nome}.")
+                    QMessageBox.information(
+                        self,
+                        "Sucesso",
+                        f"Aluno '{nome_aluno}' removido de {nome_dia_ativo}, turno {turno_nome}! "
+                        "As alterações serão sincronizadas com o Dropbox ao fechar o programa."
+                    )
+                    return
+
+                except Exception as e:
+                    print(f"Erro ao remover aluno do banco de dados: {str(e)}")
+                    QMessageBox.critical(self, "Erro", f"Erro ao remover aluno do banco de dados: {str(e)}")
+                    return
+
+        if not aluno_encontrado:
+            QMessageBox.warning(self, "Erro", f"Aluno '{nome_aluno}' não encontrado na tabela do turno {turno}.")
+            
+
+    def adicionar_aluno_na_tabela(self, nome, data_str, turno, prescricao, observacao):
+
+        data_selecionada = QDate.fromString(data_str, "yyyy-MM-dd")
+        indice_dia = data_selecionada.dayOfWeek()
+        if indice_dia == 7:
+            QtWidgets.QMessageBox.warning(self, 'Erro', 'Não há agendamentos para Domingo.')
+            return
+
+
+        dias_da_semana = ["Segunda-Feira", "Terça-Feira", "Quarta-Feira", "Quinta-Feira", "Sexta-Feira", "Sábado"]
+        nome_dia_ativo = dias_da_semana[indice_dia - 1]
+
+
+        tab_widget_principal = self.tabWidget
+        dia_ativo = tab_widget_principal.widget(indice_dia - 1)
+
+        if not dia_ativo:
+            QtWidgets.QMessageBox.warning(self, 'Erro', f'Nenhum dia ativo foi encontrado para {nome_dia_ativo}.')
+            return
+
+
+        tab_turnos = dia_ativo.findChild(QtWidgets.QTabWidget)
+        if not tab_turnos:
+            QtWidgets.QMessageBox.warning(self, 'Erro', f'Nenhum turno encontrado para {nome_dia_ativo}.')
+            return
+
+
+        indice_turno = 0 if turno == "Manhã" else 1
+        turno_ativo = tab_turnos.widget(indice_turno)
+
+
+        tabela_turno = turno_ativo.findChild(QtWidgets.QTableWidget)
+        if not tabela_turno:
+            QtWidgets.QMessageBox.warning(self, 'Erro', f'Nenhuma tabela encontrada para {nome_dia_ativo}, {turno}.')
+            return
+
+
+        if tabela_turno.columnCount() != 4:
+            tabela_turno.setColumnCount(4)
+            tabela_turno.setHorizontalHeaderLabels(["Alunos", "Prescrição", "Observação", "Check-in"])
+
+
+        for row in range(tabela_turno.rowCount()):
+            item_aluno = tabela_turno.item(row, 0)
+            if item_aluno and item_aluno.text() == nome:
+                QtWidgets.QMessageBox.warning(self, 'Atenção', f'O aluno "{nome}" já está cadastrado para {nome_dia_ativo}, {turno}.')
+                return
+
+
+        row = tabela_turno.rowCount()
+        tabela_turno.insertRow(row)
+        tabela_turno.setItem(row, 0, QtWidgets.QTableWidgetItem(nome))
+        tabela_turno.setItem(row, 1, QtWidgets.QTableWidgetItem(prescricao if prescricao else ""))
+        tabela_turno.setItem(row, 2, QtWidgets.QTableWidgetItem(observacao))
+        checkin_item = QtWidgets.QTableWidgetItem("Ausente")
+        checkin_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+        tabela_turno.setItem(row, 3, checkin_item)
+
+        QtWidgets.QMessageBox.information(self, 'Sucesso', f'Dados adicionados à {nome_dia_ativo}, {turno}!')
+
+    def configurar_table_financeiro(self):
+        """Configura a table_financeiro para consulta."""
+
+        self.table_financeiro.setColumnCount(3)
+        self.table_financeiro.setHorizontalHeaderLabels(["Aluno", "Plano", "Status"])
+        
+
+        header = self.table_financeiro.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Stretch)
+        
+        font = QFont()
+        font.setPointSize(12)
+        self.table_financeiro.setFont(font)
+        
+
+        self.carregar_dados_financeiro()
+
+    def carregar_dados_financeiro(self):
+        """
+        Carrega os dados financeiros do banco de dados e preenche a tabela table_financeiro.
+        """
+        try:
+            # Usa a conexão gerenciada (self.conn) para executar as consultas
+            self.cursor.execute("SELECT cliente, plano, status FROM financas")
+            dados_financas = self.cursor.fetchall()
+
+            clientes_validos = []
+            for cliente, plano, status in dados_financas:
+                self.cursor.execute("SELECT COUNT(*) FROM usuarios WHERE nome = ?", (cliente,))
+                existe = self.cursor.fetchone()[0] > 0
+                if existe:
+                    clientes_validos.append((cliente, plano, status))
+
+            # Configura a tabela com os dados válidos
+            self.table_financeiro.setRowCount(len(clientes_validos))
+
+            for row, (cliente, plano, status) in enumerate(clientes_validos):
+                aluno_item = QTableWidgetItem(cliente)
+                aluno_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                aluno_item.setTextAlignment(Qt.AlignCenter)
+                self.table_financeiro.setItem(row, 0, aluno_item)
+
+                plano_item = QTableWidgetItem(plano)
+                plano_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                plano_item.setTextAlignment(Qt.AlignCenter)
+                self.table_financeiro.setItem(row, 1, plano_item)
+
+                status_item = QTableWidgetItem(status)
+                status_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                status_item.setTextAlignment(Qt.AlignCenter)
+                self.table_financeiro.setItem(row, 2, status_item)
+
+                self.aplicar_estilo_status_financeiro(row, status)
+
+        except Exception as e:
+            QMessageBox.critical(self, 'Erro', f'Erro ao carregar dados da table_financeiro: {str(e)}')
+
+    def configurar_table_financeiro(self):
+        """Configura a table_financeiro para consulta."""
+
+        self.table_financeiro.setColumnCount(3)
+        self.table_financeiro.setHorizontalHeaderLabels(["Aluno", "Plano", "Status"])
+
+        header = self.table_financeiro.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Stretch)
+
+        font = QFont()
+        font.setPointSize(12)
+        self.table_financeiro.setFont(font)
+
+        self.carregar_dados_financeiro()
+
+        try:
+            # Usa a conexão gerenciada (self.conn) em vez de criar uma nova conexão
+            self.cursor.execute("SELECT cliente, plano, status FROM financas")
+            dados_financas = self.cursor.fetchall()
+
+            clientes_validos = []
+            for cliente, plano, status in dados_financas:
+                self.cursor.execute("SELECT COUNT(*) FROM usuarios WHERE nome = ?", (cliente,))
+                existe = self.cursor.fetchone()[0] > 0
+                if existe:
+                    clientes_validos.append((cliente, plano, status))
+
+            self.table_financeiro.setRowCount(len(clientes_validos))
+
+            for row, (cliente, plano, status) in enumerate(clientes_validos):
+                aluno_item = QTableWidgetItem(cliente)
+                aluno_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                aluno_item.setTextAlignment(Qt.AlignCenter)
+                self.table_financeiro.setItem(row, 0, aluno_item)
+
+                plano_item = QTableWidgetItem(plano)
+                plano_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                plano_item.setTextAlignment(Qt.AlignCenter)
+                self.table_financeiro.setItem(row, 1, plano_item)
+
+                status_item = QTableWidgetItem(status)
+                status_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                status_item.setTextAlignment(Qt.AlignCenter)
+                self.table_financeiro.setItem(row, 2, status_item)
+
+                self.aplicar_estilo_status_financeiro(row, status)
+
+        except Exception as e:
+            QMessageBox.critical(self, 'Erro', f'Erro ao carregar dados da table_financeiro: {str(e)}')
+
+    def aplicar_estilo_status_financeiro(self, row, status):
+        """Aplica coloração ao campo Status na table_financeiro."""
+        status_item = self.table_financeiro.item(row, 2)
+        font = QFont()
+        if status == "Ativo":
+            status_item.setForeground(QColor(0, 255, 0))
+            font.setBold(False)
+        elif status == "Inativo":
+            status_item.setForeground(QColor(255, 0, 0))
+            font.setBold(True)
+        elif status == "Pendente":
+            status_item.setForeground(QColor(255, 165, 0))
+            font.setBold(True)
+        status_item.setFont(font)
+
+    def bkpDB(self, checked=False):
+        from datetime import datetime
+        from utils import resource_path
+        from upload_db_files import upload_db_files
+
+        try:
+            caminho_banco = resource_path("nolimits_DB.db")
+            
+            if not os.path.exists(caminho_banco):
+                raise FileNotFoundError(f"O arquivo do banco de dados não foi encontrado em: {caminho_banco}")
+
+            diretorio = os.path.dirname(caminho_banco)
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            nome_base = f"nolimits_DB_{timestamp}.db"
+            
+            caminho_backup = os.path.join(diretorio, nome_base)
+
+            shutil.copy2(caminho_banco, caminho_backup)
+            
+            # Enviar o backup para o Dropbox
+            files_to_upload = [caminho_backup]
+            upload_db_files(files_to_upload)  # Usa o caminho padrão /Aplicativos/NoLimitsdb/
+
+            QMessageBox.information(
+                self,
+                "BackUP",
+                f"Backup realizado com sucesso!\nArquivo salvo como: {nome_base} em {caminho_backup}\nEnviado para o Dropbox em /Aplicativos/NoLimitsdb/{nome_base}"
+            )
+            print(f"Backup realizado com sucesso! Arquivo salvo como: {nome_base} e enviado para o Dropbox.")
+        except Exception as e:
+            print(f"Erro ao realizar o backup ou enviar ao Dropbox: {e}")
+            QMessageBox.critical(self, "Erro", f"Falha ao realizar o backup ou enviar ao Dropbox: {e}")
+
+    def configurar_tabelas_agenda(self):
+        """Conecta o sinal de duplo clique em todas as tabelas de turno da agenda."""
+        tab_widget_principal = self.tabWidget
+        for indice_dia in range(tab_widget_principal.count()):
+            dia_ativo = tab_widget_principal.widget(indice_dia)
+            tab_turnos = dia_ativo.findChild(QtWidgets.QTabWidget)
+            if tab_turnos:
+                for indice_turno in range(tab_turnos.count()):
+                    turno_ativo = tab_turnos.widget(indice_turno)
+                    tabela_turno = turno_ativo.findChild(QtWidgets.QTableWidget)
+                    if tabela_turno:
+                        tabela_turno.cellDoubleClicked.connect(self.alternar_status_checkin)
+
+    def alternar_status_checkin(self, row, column): 
+       
+        if column == 3:  
+            tabela = self.sender() 
+            item = tabela.item(row, column)
+            if item:
+                current_status = item.text()
+                novo_status = "Presente" if current_status == "Ausente" else "Ausente"
+                novo_item = QTableWidgetItem(novo_status)
+                novo_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                tabela.setItem(row, column, novo_item)
+
+    def atualizar_listwidget(self, nome_aluno):
+        self.listWidget.addItem(nome_aluno)
+
+    def configurar_tabela_financas(self):
+      
+        self.lista_financas.setHorizontalHeaderLabels(['Cliente', 'Plano', 'Início', 'Validade', 'Status'])
+        
+        header = self.lista_financas.horizontalHeader()
+        header.setDefaultSectionSize(180)
+        header.setSectionResizeMode(QHeaderView.Fixed)
+
+        
+        self.lista_financas.setMinimumWidth(5 * 180)  
+        
+       
+        self.carregar_dados_financas()
+        
+        self.btn_salvarFinancas.clicked.connect(self.salvar_financas)
+        self.btn_ativar.clicked.connect(self.ativar_aluno)
+        self.btn_inativar.clicked.connect(self.inativar_aluno)
+        self.btn_pendencia.clicked.connect(self.pender_aluno)
+
+    def carregar_dados_financas(self):
+        try:
+            self.cursor.execute("SELECT nome, plano FROM usuarios WHERE tipo_usuario = 'Aluno'")
+            alunos = self.cursor.fetchall()
+
+            self.cursor.execute("SELECT cliente, plano, inicio, validade, status FROM financas")
+            financas_existentes = {row[0]: row[1:] for row in self.cursor.fetchall()}
+            
+            self.lista_financas.setRowCount(len(alunos))
+            font = QFont()
+            font.setPointSize(14)
+            self.lista_financas.setFont(font)
+
+            for row, (nome, plano) in enumerate(alunos):
+                cliente_item = QTableWidgetItem(nome)
+                cliente_item.setFlags(cliente_item.flags() & ~Qt.ItemIsEditable)
+                self.lista_financas.setItem(row, 0, cliente_item)
+
+                plano_item = QTableWidgetItem(plano)
+                plano_item.setFlags(plano_item.flags() & ~Qt.ItemIsEditable)
+                self.lista_financas.setItem(row, 1, plano_item)
+
+                if nome in financas_existentes:
+                    plano_existente, inicio, validade, status = financas_existentes[nome]
+                    self.lista_financas.setItem(row, 2, QTableWidgetItem(inicio))
+                    self.lista_financas.setItem(row, 3, QTableWidgetItem(validade))
+                    status_item = QTableWidgetItem(status)
+                    self.lista_financas.setItem(row, 4, status_item)
+                    self.aplicar_estilo_status(row, status)
+                else:
+                    self.lista_financas.setItem(row, 2, QTableWidgetItem(""))
+                    self.lista_financas.setItem(row, 3, QTableWidgetItem(""))
+                    status_item = QTableWidgetItem("Ativo")
+                    self.lista_financas.setItem(row, 4, status_item)
+                    self.aplicar_estilo_status(row, "Ativo")
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, 'Erro', f'Erro ao carregar dados: {str(e)}')
+
+    def aplicar_estilo_status(self, row, status):
+        cliente_item = self.lista_financas.item(row, 0)
+        font = QFont()
+        if status == "Ativo":
+            cliente_item.setForeground(QColor(0, 255, 0))
+            font.setBold(False)
+        elif status == "Inativo":
+            cliente_item.setForeground(QColor(255, 0, 0))
+            font.setBold(True)
+        elif status == "Pendente":
+            cliente_item.setForeground(QColor(255, 165, 0))
+            font.setBold(True)
+        cliente_item.setFont(font)
+
+    def ativar_aluno(self):
+        row = self.lista_financas.currentRow()
+        if row == -1: 
+            QtWidgets.QMessageBox.warning(self, 'Aviso', 'Selecione um aluno na tabela.')
+            return
+        status_item = QTableWidgetItem("Ativo")
+        self.lista_financas.setItem(row, 4, status_item)
+        self.aplicar_estilo_status(row, "Ativo")
+
+    def inativar_aluno(self):
+        row = self.lista_financas.currentRow()
+        if row == -1:
+            QtWidgets.QMessageBox.warning(self, 'Aviso', 'Selecione um aluno na tabela.')
+            return
+        status_item = QTableWidgetItem("Inativo")
+        self.lista_financas.setItem(row, 4, status_item)
+        self.aplicar_estilo_status(row, "Inativo")
+
+    def pender_aluno(self):
+        row = self.lista_financas.currentRow()
+        if row == -1:
+            QtWidgets.QMessageBox.warning(self, 'Aviso', 'Selecione um aluno na tabela.')
+            return
+        status_item = QTableWidgetItem("Pendente")
+        self.lista_financas.setItem(row, 4, status_item)
+        self.aplicar_estilo_status(row, "Pendente")
+
+    def salvar_financas(self):
+        try:
+            # Itera sobre todas as linhas da tabela de finanças
+            for row in range(self.lista_financas.rowCount()):
+                cliente = self.lista_financas.item(row, 0).text()
+                plano = self.lista_financas.item(row, 1).text()
+                inicio = (
+                    self.lista_financas.item(row, 2).text().strip()
+                    if self.lista_financas.item(row, 2)
+                    else ""
+                )
+                validade = (
+                    self.lista_financas.item(row, 3).text().strip()
+                    if self.lista_financas.item(row, 3)
+                    else ""
+                )
+                status = (
+                    self.lista_financas.item(row, 4).text().strip()
+                    if self.lista_financas.item(row, 4)
+                    else "Ativo"
+                )
+
+                # Verifica se o aluno está cadastrado no banco de dados
+                self.cursor.execute(
+                    "SELECT COUNT(*) FROM usuarios WHERE nome = ? AND tipo_usuario = 'Aluno'", (cliente,)
+                )
+                existe = self.cursor.fetchone()[0] > 0
+
+                if not existe:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Aviso",
+                        f'O aluno "{cliente}" não está cadastrado. Cadastre-o antes de salvar os dados financeiros.',
+                    )
+                    return
+
+                # Verifica se os campos de início e validade estão preenchidos
+                if not inicio or not validade:
+                    QtWidgets.QMessageBox.warning(
+                        self, "Aviso", f'Preencha início e validade para {cliente}.'
+                    )
+                    return
+
+                # Verifica se já existe um registro para o cliente
+                self.cursor.execute(
+                    "SELECT COUNT(*) FROM financas WHERE cliente = ?", (cliente,)
+                )
+                existe_registro = self.cursor.fetchone()[0] > 0
+
+                if existe_registro:
+                    # Atualiza o registro existente
+                    self.cursor.execute(
+                        """
+                        UPDATE financas
+                        SET plano = ?, inicio = ?, validade = ?, status = ?
+                        WHERE cliente = ?
+                        """,
+                        (plano, inicio, validade, status, cliente),
+                    )
+                else:
+                    # Insere um novo registro
+                    self.cursor.execute(
+                        """
+                        INSERT INTO financas (cliente, plano, inicio, validade, status)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (cliente, plano, inicio, validade, status),
+                    )
+
+            # Confirma as alterações no banco de dados
+            self.conn.commit()
+
+            # Exibe mensagem de sucesso
+            QtWidgets.QMessageBox.information(
+                self, "Sucesso", "Dados financeiros salvos com sucesso!"
+            )
+
+        except Exception as e:
+            # Em caso de erro, faz rollback das alterações e exibe mensagem de erro
+            self.conn.rollback()
+            QtWidgets.QMessageBox.critical(
+                self, "Erro", f"Erro ao salvar finanças: {str(e)}"
+            )
+
+
+        self.carregar_dados_financas()
+        self.carregar_dados_financeiro()
+
+    def limpar_observacoes(self):
+        self.tx_observacoes.clear()
+
+    def salvar_observacoes(self):
+
+        aluno_selecionado = self.listWidget.currentItem()
+        if not aluno_selecionado:
+            QtWidgets.QMessageBox.warning(self, 'Erro', 'Selecione um aluno na lista antes de salvar observações.')
+            return
+
+        nome_aluno = aluno_selecionado.text()
+        observacoes = self.tx_observacoes.toPlainText().strip()
+
+        try:
+
+            with database.conectar_banco(self.local_db_path, modo_edicao=True) as conn:
+                cursor = conn.cursor()
+                
+
+                if not observacoes:
+                    cursor.execute('''
+                        UPDATE usuarios
+                        SET observacoes = NULL
+                        WHERE nome = ? AND tipo_usuario = 'Aluno'
+                    ''', (nome_aluno,))
+                    conn.commit()
+                    QtWidgets.QMessageBox.information(self, 'Sucesso', f'Observações do aluno {nome_aluno} foram limpas!')
+                else:
+
+                    cursor.execute('''
+                        UPDATE usuarios
+                        SET observacoes = ?
+                        WHERE nome = ? AND tipo_usuario = 'Aluno'
+                    ''', (observacoes, nome_aluno))
+                    conn.commit()
+                    QtWidgets.QMessageBox.information(self, 'Sucesso', f'Observações salvas para o aluno {nome_aluno}!')
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, 'Erro', f'Erro ao salvar observações: {str(e)}')
+
+    def enviar_anexo(self):
+        """
+        Envia um anexo para o aluno selecionado e salva no banco de dados.
+        """
+        import json
+        import os
+
+        # Verifica se um aluno está selecionado
+        aluno_selecionado = self.listWidget.currentItem()
+        if not aluno_selecionado:
+            QtWidgets.QMessageBox.warning(self, 'Erro', 'Selecione um aluno na lista antes de enviar o anexo.')
+            return
+
+        nome_aluno = aluno_selecionado.text()
+
+        # Verifica se um arquivo foi selecionado
+        if not hasattr(self, 'arquivo_selecionado') or not self.arquivo_selecionado:
+            QtWidgets.QMessageBox.warning(self, 'Erro', 'Nenhum anexo foi selecionado. Use o botão "Selecionar Anexo" primeiro.')
+            return
+
+        try:
+            # Lê o arquivo selecionado e converte para hexadecimal
+            with open(self.arquivo_selecionado, 'rb') as file:
+                anexo_binario = file.read()
+                nome_arquivo = os.path.basename(self.arquivo_selecionado)
+                anexo_hex = anexo_binario.hex()
+
+            # Usa a conexão gerenciada (self.conn) para executar as consultas
+            self.cursor.execute('''
+                SELECT anexos FROM usuarios 
+                WHERE nome = ? AND tipo_usuario = 'Aluno'
+            ''', (nome_aluno,))
+            resultado = self.cursor.fetchone()
+
+            # Processa os anexos existentes
+            if resultado and resultado[0]:
+                try:
+                    lista_anexos = json.loads(resultado[0])
+                except json.JSONDecodeError:
+                    # Caso o formato antigo seja usado ("nome|hex")
+                    nome_antigo, hex_antigo = resultado[0].split("|", 1)
+                    lista_anexos = [{"nome": nome_antigo, "conteudo": hex_antigo}]
+            else:
+                lista_anexos = []
+
+            # Adiciona o novo anexo à lista
+            lista_anexos.append({"nome": nome_arquivo, "conteudo": anexo_hex})
+
+            # Atualiza o banco de dados com a nova lista de anexos
+            self.cursor.execute('''
+                UPDATE usuarios
+                SET anexos = ?
+                WHERE nome = ? AND tipo_usuario = 'Aluno'
+            ''', (json.dumps(lista_anexos), nome_aluno))
+            self.conn.commit()
+
+            # Feedback ao usuário
+            QtWidgets.QMessageBox.information(self, 'Sucesso', f'Anexo salvo com sucesso para o aluno {nome_aluno}!')
+
+            # Atualiza a lista de anexos na interface
+            self.carregar_anexos_aluno(nome_aluno)
+
+            # Limpa o arquivo selecionado
+            self.arquivo_selecionado = None
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, 'Erro', f'Erro ao salvar o anexo: {str(e)}')
+
+    def atualizar_lista_anexos(self, nome_aluno):
+        """
+        Atualiza a lista de anexos para o aluno especificado.
+        """
+        try:
+            # Usa a conexão gerenciada (self.conn) para executar as consultas
+            self.cursor.execute('''
+                SELECT anexos FROM usuarios 
+                WHERE nome = ? AND tipo_usuario = 'Aluno'
+            ''', (nome_aluno,))
+            resultado = self.cursor.fetchone()
+
+            # Limpa a lista de anexos na interface
+            self.listAnexos.clear()
+
+            if resultado and resultado[0]:
+                anexo_com_nome = resultado[0]
+                if isinstance(anexo_com_nome, str) and "|" in anexo_com_nome:
+                    nome_arquivo, _ = anexo_com_nome.split("|", 1)
+
+                    item = QtWidgets.QListWidgetItem(nome_arquivo)
+                    self.listAnexos.addItem(item)
+                else:
+                    QtWidgets.QMessageBox.warning(self, 'Aviso', 'Formato de anexo inválido no banco de dados.')
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, 'Erro', f'Erro ao atualizar a lista de anexos: {str(e)}')
+
+    def carregar_anexos_aluno(self, nome_aluno):
+        """
+        Carrega os anexos do aluno especificado no banco de dados e preenche a lista de anexos.
+        """
+        import json
+
+        try:
+            # Usa a conexão gerenciada (self.conn) para executar as consultas
+            self.cursor.execute('''
+                SELECT anexos FROM usuarios 
+                WHERE nome = ? AND tipo_usuario = 'Aluno'
+            ''', (nome_aluno,))
+            resultado = self.cursor.fetchone()
+
+            # Limpa a lista de anexos na interface
+            self.listAnexos.clear()
+
+            if resultado and resultado[0]:
+                try:
+                    lista_anexos = json.loads(resultado[0])
+                except json.JSONDecodeError:
+                    # Caso o formato antigo seja usado ("nome|conteudo")
+                    nome_antigo, conteudo_antigo = resultado[0].split("|", 1)
+                    lista_anexos = [{"nome": nome_antigo, "conteudo": conteudo_antigo}]
+
+                # Adiciona os nomes dos anexos à lista na interface
+                for anexo in lista_anexos:
+                    item = QtWidgets.QListWidgetItem(anexo["nome"])
+                    self.listAnexos.addItem(item)
+
+        except Exception as e:
+            print(f"Erro ao carregar anexos: {str(e)}")
+
+    def mostrar_dados_aluno(self, item):
+        """
+        Carrega e exibe os dados do aluno selecionado na interface.
+        """
+        nome_aluno = item.text()
+
+        try:
+            # Usa a conexão gerenciada (self.conn) para executar as consultas
+            self.cursor.execute("SELECT * FROM usuarios WHERE nome = ?", (nome_aluno,))
+            aluno_data = self.cursor.fetchone()
+
+            if not aluno_data:
+                QtWidgets.QMessageBox.warning(self, 'Erro', f'Aluno "{nome_aluno}" não encontrado no banco de dados.')
+                return
+
+            campos = {
+                'nome': aluno_data[13],  
+                'plano': aluno_data[17] if aluno_data[17] else "",  
+                'email': aluno_data[9] if aluno_data[9] else "", 
+                'nascimento': aluno_data[4] if aluno_data[4] else "",  
+                'nivel': aluno_data[16] if aluno_data[16] else "", 
+                'contato_emergencia': aluno_data[11] if aluno_data[11] else "",  
+                'telefone_emergencia': aluno_data[12] if aluno_data[12] else "", 
+                'objetivo': aluno_data[15] if aluno_data[15] else "", 
+                'foto_binaria': aluno_data[14],
+                'observacoes': aluno_data[19] if aluno_data[19] else ""
+            }
+
+            # Preenche os campos na interface com os dados do aluno
+            self.nome_user.setText(campos['nome'])
+            self.plano_usuario.setText(campos['plano'])
+            self.email_usuario.setText(campos['email'])
+            self.nascimento_usuario.setText(campos['nascimento'])
+            self.nivel_usuario.setText(campos['nivel'])
+            self.nome_contato_emergencia.setText(campos['contato_emergencia'])
+            self.contato_emergencia_usuario.setText(campos['telefone_emergencia'])
+            self.planejamento_usuario.setText(campos['objetivo'])
+            self.tx_observacoes.setPlainText(campos['observacoes'])
+
+            # Configura o tamanho e alinhamento da imagem
+            self.label_35.setFixedSize(200, 300)
+            self.label_35.setAlignment(Qt.AlignCenter)
+
+            # Exibe a foto do aluno ou uma imagem padrão se não houver foto
+            if campos['foto_binaria']:
+                pixmap = QPixmap()
+                pixmap.loadFromData(campos['foto_binaria'])
+                scaled_pixmap = pixmap.scaled(200, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.label_35.setPixmap(scaled_pixmap)
+            else:
+                self.label_35.setPixmap(QPixmap("midia/no_user.png"))
+
+            # Atualiza a label para refletir as mudanças
+            self.label_35.update()
+
+            # Carrega os anexos do aluno
+            self.carregar_anexos_aluno(nome_aluno)
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, 'Erro', f'Erro ao carregar dados do aluno: {str(e)}')
+
+    def abrir_anexo_selecionado(self, item):
+        aluno_selecionado = self.listWidget.currentItem()
+        if aluno_selecionado:
+            nome_aluno = aluno_selecionado.text()
+            self.abrir_anexo_aluno(nome_aluno)
+
+    def abrir_anexo_aluno(self, nome_aluno):
+        import os
+        import platform
+        import subprocess
+        import tempfile
+        import json
+        
+        aluno_selecionado = self.listWidget.currentItem()
+        if not aluno_selecionado:
+            QtWidgets.QMessageBox.warning(self, 'Erro', 'Selecione um aluno na lista antes de abrir um anexo.')
+            return
+
+        nome_aluno = aluno_selecionado.text()
+
+
+        anexo_selecionado = self.listAnexos.currentItem()
+        if not anexo_selecionado:
+            QtWidgets.QMessageBox.warning(self, 'Erro', 'Selecione um anexo na lista para abrir.')
+            return
+
+        nome_arquivo_selecionado = anexo_selecionado.text()
+
+        try:
+
+            with database.conectar_banco(self.local_db_path, modo_edicao=True) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT anexos FROM usuarios 
+                    WHERE nome = ? AND tipo_usuario = 'Aluno'
+                ''', (nome_aluno,))
+                resultado = cursor.fetchone()
+
+            if not resultado or not resultado[0]:
+                QtWidgets.QMessageBox.warning(self, 'Aviso', 'Nenhum anexo encontrado para este aluno.')
+                return
+
+
+            try:
+                lista_anexos = json.loads(resultado[0])
+            except json.JSONDecodeError:
+
+                nome_antigo, hex_antigo = resultado[0].split("|", 1)
+                lista_anexos = [{"nome": nome_antigo, "conteudo": hex_antigo}]
+
+
+            anexo_encontrado = next((anexo for anexo in lista_anexos if anexo["nome"] == nome_arquivo_selecionado), None)
+            if not anexo_encontrado:
+                QtWidgets.QMessageBox.warning(self, 'Erro', 'Anexo selecionado não encontrado no banco de dados.')
+                return
+
+            anexo_binario = bytes.fromhex(anexo_encontrado["conteudo"])
+
+
+            temp_dir = tempfile.gettempdir()
+            caminho_temp = os.path.join(temp_dir, nome_arquivo_selecionado)
+            with open(caminho_temp, 'wb') as temp_file:
+                temp_file.write(anexo_binario)
+
+
+            sistema_operacional = platform.system().lower()
+            if sistema_operacional == 'windows':
+                os.startfile(caminho_temp)
+            elif sistema_operacional == 'darwin':
+                subprocess.run(['open', caminho_temp], check=True)
+            else:
+                QtWidgets.QMessageBox.warning(self, 'Aviso', 'Sistema operacional não suportado para abrir arquivos.')
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, 'Erro', f'Erro ao abrir o anexo: {str(e)}')
+
+    def preencher_cmb_PLANO(self):
+        self.cmb_PLANO.clear()
+        planos = ["1 Dia", "2 Dias", "3 Dias", "4 Dias", "5 Dias"]
+        self.cmb_PLANO.addItems(planos)
+
+    def preencher_comboBox(self):
+
+        self.comboBox.clear()
+        tipos_usuario = ["Administrador", "Aluno", "Professor", "Estagiário"]
+        self.comboBox.addItems(tipos_usuario)
+
+    def preencher_cmb_NIVEL(self):
+        """
+        Preenche o cmb_NIVEL com os níveis disponíveis.
+        """
+        self.cmb_NIVEL.clear()
+        niveis = ["Iniciante", "Intermediário", "Avançado", "Runner"]
+        self.cmb_NIVEL.addItems(niveis)
+
+    def preencher_cmb_PLAN(self):
+        """
+        Preenche o cmb_PLAN com os planejamentos disponíveis no banco de dados.
+        """
+        self.cmb_PLAN.clear()
+        self.cmb_PLAN.updateGeometry()
+        self.cmb_PLAN.update()
+
+        try:
+            # Usa a conexão gerenciada (self.conn) para executar as consultas
+            self.cursor.execute(
+                "SELECT conteudo FROM registros WHERE tipo_registro = 'Planejamento' ORDER BY conteudo ASC"
+            )
+            planejamentos = self.cursor.fetchall()
+
+            for planejamento in planejamentos:
+                self.cmb_PLAN.addItem(planejamento[0])
+
+            # Ajusta a largura do ComboBox
+            self.ajustar_largura_combobox()
+
+        except Exception as e:
+            print(f"Erro ao carregar planejamentos: {str(e)}")
+
+        except Exception as e:
+            print(f"Erro ao carregar planejamentos: {str(e)}")
+
+    def ajustar_largura_combobox(self):
+        """
+        Ajusta automaticamente a largura do cmb_PLAN com base no maior item.
+        """
+        font_metrics = self.cmb_PLAN.fontMetrics()
+        max_width = 0
+
+        for i in range(self.cmb_PLAN.count()):
+            text = self.cmb_PLAN.itemText(i)
+            text_width = font_metrics.horizontalAdvance(text)
+            max_width = max(max_width, text_width)
+
+
+        self.cmb_PLAN.view().setMinimumWidth(max_width + 20)
+        self.cmb_PLAN.setMinimumWidth(max_width + 50)
+
+    def carregar_dados_do_db(self):
+        import sqlite3
+
+        try:
+
+            conexao = sqlite3.connect('db/nolimits_DB.db')
+            cursor = conexao.cursor()
+
+
+            cursor.execute("SELECT aluno, prescricao, observacao, dia, turno, check_in FROM dados_semana")
+            registros = cursor.fetchall()
+
+
+
+
+
+
+            tab_widget_principal = self.tabWidget
+            for registro in registros:
+                aluno, prescricao, observacao, dia, turno, check_in = registro
+
+                for indice_dia in range(tab_widget_principal.count()):
+                    nome_dia_ativo = tab_widget_principal.tabText(indice_dia)
+                    if nome_dia_ativo == dia:
+                        dia_ativo = tab_widget_principal.widget(indice_dia)
+                        tab_turnos = dia_ativo.findChild(QtWidgets.QTabWidget)
+                        if tab_turnos:
+                            for indice_turno in range(tab_turnos.count()):
+                                turno_nome = tab_turnos.tabText(indice_turno)
+                                if turno_nome == turno:
+                                    turno_ativo = tab_turnos.widget(indice_turno)
+                                    tabela_turno = turno_ativo.findChild(QtWidgets.QTableWidget)
+                                    if tabela_turno:
+                                        row = tabela_turno.rowCount()
+                                        tabela_turno.insertRow(row)
+                                        tabela_turno.setItem(row, 0, QtWidgets.QTableWidgetItem(aluno))
+                                        tabela_turno.setItem(row, 1, QtWidgets.QTableWidgetItem(prescricao))
+                                        tabela_turno.setItem(row, 2, QtWidgets.QTableWidgetItem(observacao))
+                                        tabela_turno.setItem(row, 3, QtWidgets.QTableWidgetItem(check_in))
+                                        break
+
+
+
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, 'Erro', f'Erro ao carregar dados do banco de dados: {str(e)}')
+
+        finally:
+
+            if 'conexao' in locals():
+                conexao.close()
+
+    def conectar_botoes_salvar(self):
+        sufixos = ['', '_2', '_3', '_4', '_5', '_6']  
+
+        for sufixo in sufixos:
+            nome_botao = f'btn_salvarAgenda{sufixo}' 
+            botao = getattr(self, nome_botao, None) 
+            if botao:
+                botao.clicked.connect(lambda _, s=sufixo: self.salvar_dados(s))
+            else:
+                print(f"Botão {nome_botao} não encontrado no .ui. Verifique o nome no Qt Designer.")
+
+    def salvar_dados(self, sufixo):
+        from PySide6 import QtWidgets
+
+        if not self.modo_edicao:
+            QtWidgets.QMessageBox.warning(self, 'Aviso', 'Modo somente leitura. Salvamento não permitido.')
+            return
+
+        # Mensagem de confirmação com botões personalizados
+        msg = QtWidgets.QMessageBox(self)
+        msg.setWindowTitle('Confirmação')
+        msg.setText('Ao clicar em "Salvar", todos os dados atuais no banco de dados serão deletados permanentemente e substituídos pelos novos dados da agenda. Deseja continuar?')
+        btn_sim = msg.addButton('Sim', QtWidgets.QMessageBox.YesRole)
+        btn_nao = msg.addButton('Não', QtWidgets.QMessageBox.NoRole)
+        msg.setDefaultButton(btn_nao)  # Define "Não" como padrão
+        msg.exec()
+
+        if msg.clickedButton() != btn_sim:
+            QtWidgets.QMessageBox.information(self, 'Cancelado', 'Operação de salvamento cancelada.')
+            return
+
+        try:
+            cursor = self.conn.cursor()
+            tab_widget_principal = self.tabWidget
+            for indice_dia in range(tab_widget_principal.count()):
+                nome_dia_ativo = tab_widget_principal.tabText(indice_dia)
+                dia_ativo = tab_widget_principal.widget(indice_dia)
+                tab_turnos = dia_ativo.findChild(QtWidgets.QTabWidget)
+                if not tab_turnos:
+                    continue
+                for indice_turno in range(tab_turnos.count()):
+                    turno_nome = tab_turnos.tabText(indice_turno)
+                    turno_ativo = tab_turnos.widget(indice_turno)
+                    tabela_turno = turno_ativo.findChild(QtWidgets.QTableWidget)
+                    if not tabela_turno:
+                        continue
+                    cursor.execute('''
+                        DELETE FROM dados_semana
+                        WHERE dia = ? AND turno = ?
+                    ''', (nome_dia_ativo, turno_nome))
+                    for row in range(tabela_turno.rowCount()):
+                        aluno = tabela_turno.item(row, 0).text() if tabela_turno.item(row, 0) else ""
+                        prescricao = tabela_turno.item(row, 1).text() if tabela_turno.item(row, 1) else ""
+                        observacao = tabela_turno.item(row, 2).text() if tabela_turno.item(row, 2) else ""
+                        check_in = tabela_turno.item(row, 3).text() if tabela_turno.item(row, 3) else "Ausente"
+                        cursor.execute('''
+                            INSERT INTO dados_semana (aluno, prescricao, observacao, dia, turno, check_in)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        ''', (aluno, prescricao, observacao, nome_dia_ativo, turno_nome, check_in))
+            self.conn.commit()
+
+            QtWidgets.QMessageBox.information(self, 'Sucesso', 'Dados salvos com sucesso!')
+
+        except Exception as e:
+            self.conn.rollback()  # Faz rollback em caso de erro
+            QtWidgets.QMessageBox.critical(self, 'Erro', f'Erro ao salvar dados: {str(e)}')
+            
+
+    def conectar_botoes(self):
+     
+        sufixos = ['', '_2', '_3', '_4', '_5', '_6']  
+
+        for sufixo in sufixos:
+            nome_botao = f'btn_delete{sufixo}'  
+            botao = getattr(self, nome_botao, None)  
+
+            if botao:
+                botao.clicked.connect(lambda _, s=sufixo: self.excluir_aluno(s))
+            else:
+                print(f"Botão {nome_botao} não encontrado no .ui. Verifique o nome no Qt Designer.")
+
+    def excluir_aluno(self, sufixo):
+        # Mapeamento do sufixo para o índice da aba (dia da semana)
+        tab_widget_principal = self.tabWidget
+        mapa_sufixo_indice = {
+            '': 0,
+            '_2': 1,
+            '_3': 2,
+            '_4': 3,
+            '_5': 4,
+            '_6': 5
+        }
+        indice_pagina = mapa_sufixo_indice.get(sufixo, -1)
+        if indice_pagina == -1:
+            QtWidgets.QMessageBox.warning(self, 'Erro', f'Sufixo inválido: {sufixo}')
+            return
+
+        # Obter a aba do dia
+        dia_ativo = tab_widget_principal.widget(indice_pagina)
+        if not dia_ativo:
+            QtWidgets.QMessageBox.warning(self, 'Erro', f'Nenhuma página encontrada para o índice {indice_pagina}.')
+            return
+
+        # Obter a sub-aba de turnos (Manhã/Tarde)
+        tab_turnos = dia_ativo.findChild(QtWidgets.QTabWidget)
+        if not tab_turnos:
+            QtWidgets.QMessageBox.warning(self, 'Erro', 'Nenhum turno encontrado para o dia ativo.')
+            return
+
+        # Obter o turno ativo
+        turno_ativo = tab_turnos.currentWidget()
+        if not turno_ativo:
+            QtWidgets.QMessageBox.warning(self, 'Erro', 'Nenhum turno ativo encontrado.')
+            return
+
+        # Obter a tabela do turno
+        tabela_turno = turno_ativo.findChild(QtWidgets.QTableWidget)
+        if not tabela_turno:
+            QtWidgets.QMessageBox.warning(self, 'Erro', 'Nenhuma tabela encontrada para o turno ativo.')
+            return
+
+        # Verificar se uma linha está selecionada
+        linha_selecionada = tabela_turno.currentRow()
+        if linha_selecionada == -1:
+            QtWidgets.QMessageBox.warning(self, 'Atenção', 'Selecione um aluno para remover.')
+            return
+
+        # Obter os dados da linha selecionada
+        nome_aluno = tabela_turno.item(linha_selecionada, 0).text()
+        if not nome_aluno:
+            QtWidgets.QMessageBox.warning(self, 'Atenção', 'Nome do aluno não pode estar vazio.')
+            return
+
+        nome_dia_ativo = tab_widget_principal.tabText(indice_pagina)  # Ex.: "Segunda-Feira"
+        turno_nome = tab_turnos.tabText(tab_turnos.currentIndex())  # Ex.: "Manhã"
+
+        # Confirmar a exclusão com o usuário
+        msg = QtWidgets.QMessageBox(self)
+        msg.setWindowTitle('Confirmar Exclusão')
+        msg.setText(f'Deseja realmente excluir o aluno "{nome_aluno}" de {nome_dia_ativo}, turno {turno_nome}?')
+        botao_sim = msg.addButton("Sim", QtWidgets.QMessageBox.YesRole)
+        botao_nao = msg.addButton("Não", QtWidgets.QMessageBox.NoRole)
+        msg.setDefaultButton(botao_nao)
+        msg.exec()
+
+        if msg.clickedButton() == botao_sim:
+            try:
+                conn = database.conectar_banco(self.local_db_path, modo_edicao=True)
+                cursor = conn.cursor()
+
+                # Normalizar os valores (mantendo o formato do banco: "Segunda-Feira")
+                nome_aluno_normalizado = nome_aluno.strip()
+                dia_normalizado = nome_dia_ativo.strip()  # Mantém "Segunda-Feira" como está no banco
+                turno_normalizado = turno_nome.strip()
+
+                # Log para verificar os valores
+                print(f"Valores brutos: aluno='{nome_aluno}', dia='{nome_dia_ativo}', turno='{turno_nome}'")
+                print(f"Valores normalizados para a query: aluno='{nome_aluno_normalizado}', dia='{dia_normalizado}', turno='{turno_normalizado}'")
+
+                # Passo 1: Verificar se o registro existe no banco
+                cursor.execute('''
+                    SELECT COUNT(*) FROM dados_semana
+                    WHERE aluno = ? AND dia = ? AND turno = ?
+                ''', (nome_aluno_normalizado, dia_normalizado, turno_normalizado))
+                count = cursor.fetchone()[0]
+                print(f"Registros encontrados: {count}")
+
+                if count == 0:
+                    # Log adicional para ajudar a diagnosticar
+                    cursor.execute('''
+                        SELECT dia, turno FROM dados_semana
+                        WHERE aluno = ?
+                    ''', (nome_aluno_normalizado,))
+                    registros = cursor.fetchall()
+                    print(f"Registros existentes para o aluno '{nome_aluno_normalizado}': {registros}")
+                    QtWidgets.QMessageBox.warning(self, 'Aviso', 
+                        f'Nenhum registro encontrado no banco para "{nome_aluno}" em {nome_dia_ativo}, turno {turno_nome}.')
+                    conn.close()
+                    return
+
+                # Passo 2: Executar a exclusão
+                cursor.execute('''
+                    DELETE FROM dados_semana
+                    WHERE aluno = ? AND dia = ? AND turno = ?
+                ''', (nome_aluno_normalizado, dia_normalizado, turno_normalizado))
+                linhas_afetadas = cursor.rowcount
+                conn.commit()
+                conn.close()
+
+                print(f"Aluno {nome_aluno} removido do banco de dados para o dia {nome_dia_ativo}, turno {turno_nome}. Linhas afetadas: {linhas_afetadas}")
+
+                # Passo 3: Remover da tabela visual
+                tabela_turno.removeRow(linha_selecionada)
+
+                # Mensagem de sucesso
+                QtWidgets.QMessageBox.information(self, 'Sucesso', 
+                    f'Aluno "{nome_aluno}" removido com sucesso de {nome_dia_ativo}, turno {turno_nome}!')
+
+            except Exception as e:
+                print(f"Erro ao remover aluno do banco de dados: {str(e)}")
+                QtWidgets.QMessageBox.critical(self, "Erro", f"Erro ao remover aluno do banco de dados: {str(e)}")
+                return
+
+        elif msg.clickedButton() == botao_nao:
+            QtWidgets.QMessageBox.information(self, 'Cancelado', 'Exclusão cancelada pelo usuário.')
+
+    def adicionar_aluno_na_mainwindow(self, nome, prescricao, observacao, data_str, horario):
+        """
+        Adiciona um aluno na tabela correspondente ao dia e turno na MainWindow.
+
+        Parâmetros:
+        - nome: str - Nome do aluno.
+        - prescricao: str - Prescrição selecionada.
+        - observacao: str - Observação selecionada.
+        - data_str: str - Data no formato "yyyy-MM-dd".
+        - horario: str - Horário ("Manhã" ou "Tarde").
+        """
+        try:
+            # Determinar o dia da semana com base na data
+            data = QDate.fromString(data_str, "yyyy-MM-dd")
+            indice_dia = data.dayOfWeek()  # 1 = Segunda, 2 = Terça, ..., 6 = Sábado
+            if indice_dia == 7:  # Domingo não é suportado
+                QtWidgets.QMessageBox.warning(self, 'Erro', 'Não há agendamentos para Domingo.')
+                return
+
+            dias_da_semana = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"]
+            nome_dia_ativo = dias_da_semana[indice_dia - 1]
+
+            # Determinar o turno (matutino ou vespertino)
+            turno_nome = "matutino" if horario == "Manhã" else "vespertino"
+
+            # Localizar a aba do dia na QTabWidget principal
+            tab_widget_principal = self.tabWidget
+            dia_ativo = tab_widget_principal.widget(indice_dia - 1)
+
+            if not dia_ativo:
+                QtWidgets.QMessageBox.warning(self, 'Erro', f'Dia {nome_dia_ativo} não encontrado na interface.')
+                return
+
+            # Localizar o QTabWidget dos turnos dentro do dia ativo
+            tab_turnos = dia_ativo.findChild(QtWidgets.QTabWidget)
+            if not tab_turnos:
+                QtWidgets.QMessageBox.warning(self, 'Erro', f'Nenhum turno encontrado para {nome_dia_ativo}.')
+                return
+
+            # Determinar o turno ativo (matutino ou vespertino)
+            turno_ativo = None
+            for i in range(tab_turnos.count()):
+                if tab_turnos.tabText(i).lower() == turno_nome:
+                    turno_ativo = tab_turnos.widget(i)
+                    break
+
+            if not turno_ativo:
+                QtWidgets.QMessageBox.warning(self, 'Erro', f'Turno {turno_nome.title()} não encontrado para {nome_dia_ativo}.')
+                return
+
+            # Buscar a tabela dentro do turno ativo
+            tabela_turno = turno_ativo.findChild(QtWidgets.QTableWidget)
+            if not tabela_turno:
+                QtWidgets.QMessageBox.warning(self, 'Erro', f'Nenhuma tabela encontrada para {nome_dia_ativo}, {turno_nome.title()}.')
+                return
+
+            # Verificar se o aluno já existe na tabela
+            for row in range(tabela_turno.rowCount()):
+                item_aluno = tabela_turno.item(row, 0)  # Coluna "Aluno"
+                if item_aluno and item_aluno.text() == nome:
+                    QtWidgets.QMessageBox.warning(self, 'Atenção', f'O aluno "{nome}" já está cadastrado para {nome_dia_ativo}, {turno_nome.title()}.')
+                    return
+
+            # Adicionar os dados na tabela
+            row = tabela_turno.rowCount()
+            tabela_turno.insertRow(row)
+            tabela_turno.setItem(row, 0, QtWidgets.QTableWidgetItem(nome))
+            tabela_turno.setItem(row, 1, QtWidgets.QTableWidgetItem(prescricao if prescricao else ""))
+            tabela_turno.setItem(row, 2, QtWidgets.QTableWidgetItem(observacao))
+            checkin_item = QtWidgets.QTableWidgetItem("Ausente")
+            checkin_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            tabela_turno.setItem(row, 3, checkin_item)
+
+            # Feedback ao usuário
+            QtWidgets.QMessageBox.information(self, 'Sucesso', f'Dados adicionados à {nome_dia_ativo}, {turno_nome.title()}!')
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, 'Erro', f'Erro ao adicionar aluno na MainWindow: {str(e)}')
+            
+    
+    def salvar_dados_no_banco(self):
+        import sqlite3
+        conexao = sqlite3.connect('db/nolimits_DB.db')
+        cursor = conexao.cursor()
+
+        tab_widget_principal = self.tabWidget
+
+        for indice_dia in range(tab_widget_principal.count()):
+            dia_ativo = tab_widget_principal.widget(indice_dia)
+            nome_dia_ativo = tab_widget_principal.tabText(indice_dia)
+
+            tab_turnos = dia_ativo.findChild(QtWidgets.QTabWidget)
+            if not tab_turnos:
+                continue 
+
+            for indice_turno in range(tab_turnos.count()):
+                turno_ativo = tab_turnos.widget(indice_turno)
+                turno_nome = tab_turnos.tabText(indice_turno)
+
+                tabela_turno = turno_ativo.findChild(QtWidgets.QTableWidget)
+                if not tabela_turno:
+                    continue  
+
+                for row in range(tabela_turno.rowCount()):
+                    aluno = tabela_turno.item(row, 0).text() if tabela_turno.item(row, 0) else ""
+                    prescricao = tabela_turno.item(row, 1).text() if tabela_turno.item(row, 1) else ""
+                    observacao = tabela_turno.item(row, 2).text() if tabela_turno.item(row, 2) else ""
+                    check_in = tabela_turno.item(row, 3).text() if tabela_turno.item(row, 3) else "Ausente"
+
+                    cursor.execute('''
+                        SELECT id FROM dados_semana
+                        WHERE aluno = ? AND dia = ? AND turno = ?
+                    ''', (aluno, nome_dia_ativo, turno_nome))
+                    resultado = cursor.fetchone()
+
+                    if resultado:
+                        cursor.execute('''
+                            UPDATE dados_semana
+                            SET prescricao = ?, observacao = ?, check_in = ?
+                            WHERE id = ?
+                        ''', (prescricao, observacao, check_in, resultado[0]))
+                    else:
+                        cursor.execute('''
+                            INSERT INTO dados_semana (aluno, prescricao, observacao, dia, turno, check_in)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        ''', (aluno, prescricao, observacao, nome_dia_ativo, turno_nome, check_in))
+
+        conexao.commit()
+        conexao.close()
+
+        QtWidgets.QMessageBox.information(self, 'Sucesso', 'Dados salvos no banco de dados com sucesso!')
+
+    def salvar_no_banco(self):
+        conn = database.conectar_banco(self.local_db_path, modo_edicao=True)
+        cursor = conn.cursor()
+        print("Conectado ao banco:", conn)
+
+        dados_a_salvar = []
+
+        # Planejamentos
+        for row in range(self.twPlanejamentos.rowCount()):
+            conteudo = self.twPlanejamentos.item(row, 0).text() if self.twPlanejamentos.item(row, 0) else ""
+            if conteudo:
+                cursor.execute("SELECT conteudo FROM registros WHERE tipo_registro = 'Planejamento' AND conteudo = ?", (conteudo,))
+                if not cursor.fetchone():
+                    dados_a_salvar.append(("Planejamento", conteudo))
+
+        # Prescrições
+        for row in range(self.twPrescricoes.rowCount()):
+            conteudo = self.twPrescricoes.item(row, 0).text() if self.twPrescricoes.item(row, 0) else ""
+            if conteudo:
+                cursor.execute("SELECT conteudo FROM registros WHERE tipo_registro = 'Prescrição' AND conteudo = ?", (conteudo,))
+                if not cursor.fetchone():
+                    dados_a_salvar.append(("Prescrição", conteudo))
+
+        # Observações
+        for row in range(self.twOBS.rowCount()):
+            conteudo = self.twOBS.item(row, 0).text() if self.twOBS.item(row, 0) else ""
+            if conteudo:
+                cursor.execute("SELECT conteudo FROM registros WHERE tipo_registro = 'Observação' AND conteudo = ?", (conteudo,))
+                if not cursor.fetchone():
+                    dados_a_salvar.append(("Observação", conteudo))
+
+        dados_a_salvar.sort(key=lambda x: x[1])  # Ordena os dados a salvar alfabeticamente
+
+        if dados_a_salvar:
+            print(f"Inserindo {len(dados_a_salvar)} registros: {dados_a_salvar}")
+            cursor.executemany("INSERT INTO registros (tipo_registro, conteudo) VALUES (?, ?)", dados_a_salvar)
+            conn.commit()
+            print("Commit realizado com sucesso")
+            self.cadastro_realizado.emit()
+            QtWidgets.QMessageBox.information(self, 'Sucesso', 'Dados salvos no banco de dados com sucesso!')
+            self.carregar_registros(conn=conn)  # Passar a conexão para carregar_registros
+        else:
+            print('Atenção', 'Nenhum dado novo para salvar.')
+            conn.close()
+            self.carregar_registros()
+
+    def carregar_registros(self, conn=None):
+        from PySide6.QtWidgets import QTableWidgetItem, QHeaderView  # Ajustado para PySide6
+
+        # Limpar as tabelas
+        self.twPlanejamentos.clearContents()
+        self.twPlanejamentos.setRowCount(0)
+        self.twPrescricoes.clearContents()
+        self.twPrescricoes.setRowCount(0)
+        self.twOBS.clearContents()
+        self.twOBS.setRowCount(0)
+
+        try:
+            if conn is None:
+                conn = database.conectar_banco(self.local_db_path, modo_edicao=False)
+                close_conn = True
+            else:
+                close_conn = False
+
+            cursor = conn.cursor()
+            cursor.execute("SELECT tipo_registro, conteudo FROM registros ORDER BY conteudo ASC")
+            registros = cursor.fetchall()
+
+            # Separar e ordenar os registros por tipo
+            planejamentos = sorted([r[1] for r in registros if r[0] == "Planejamento"], key=str.lower)
+            prescricoes = sorted([r[1] for r in registros if r[0] == "Prescrição"], key=str.lower)
+            observacoes = sorted([r[1] for r in registros if r[0] == "Observação"], key=str.lower)
+
+            # Depuração para verificar os dados
+            print("Planejamentos:", planejamentos)
+            print("Prescrições:", prescricoes)
+            print("Observações:", observacoes)
+
+            # Preencher Planejamentos
+            self.twPlanejamentos.setRowCount(len(planejamentos))
+            for row, conteudo in enumerate(planejamentos):
+                item = QTableWidgetItem(conteudo)
+                item.setData(0, conteudo)  # 0 é Qt.ItemDataRole.DisplayRole em PySide6
+                self.twPlanejamentos.setItem(row, 0, item)
+            self.twPlanejamentos.setWordWrap(True)
+            self.twPlanejamentos.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            self.twPlanejamentos.resizeRowsToContents()
+
+            # Preencher Prescrições
+            self.twPrescricoes.setRowCount(len(prescricoes))
+            for row, conteudo in enumerate(prescricoes):
+                item = QTableWidgetItem(conteudo)
+                item.setData(0, conteudo)  # 0 é Qt.ItemDataRole.DisplayRole em PySide6
+                self.twPrescricoes.setItem(row, 0, item)
+            self.twPrescricoes.setWordWrap(True)
+            self.twPrescricoes.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            self.twPrescricoes.resizeRowsToContents()
+
+            # Preencher Observações
+            self.twOBS.setRowCount(len(observacoes))
+            for row, conteudo in enumerate(observacoes):
+                item = QTableWidgetItem(conteudo)
+                item.setData(0, conteudo)  # 0 é Qt.ItemDataRole.DisplayRole em PySide6
+                self.twOBS.setItem(row, 0, item)
+            self.twOBS.setWordWrap(True)
+            self.twOBS.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            self.twOBS.resizeRowsToContents()
+
+            # Verificar o total de linhas carregadas
+            print(f"Total de linhas - Planejamento: {self.twPlanejamentos.rowCount()}, "
+                f"Prescrição: {self.twPrescricoes.rowCount()}, Observação: {self.twOBS.rowCount()}")
+
+            # Configurar cabeçalhos se necessário
+            if self.twPlanejamentos.columnCount() == 0:
+                self.twPlanejamentos.setColumnCount(1)
+                self.twPlanejamentos.setHorizontalHeaderLabels(['Planejamento'])
+            if self.twPrescricoes.columnCount() == 0:
+                self.twPrescricoes.setColumnCount(1)
+                self.twPrescricoes.setHorizontalHeaderLabels(['Prescrição'])
+            if self.twOBS.columnCount() == 0:
+                self.twOBS.setColumnCount(1)
+                self.twOBS.setHorizontalHeaderLabels(['Observação'])
+
+            if close_conn:
+                conn.close()
+
+        except Exception as e:
+            print(f"Erro ao carregar registros: {str(e)}")
+            
+        
+    def carregar_alunos(self):
+        self.twAlunos.clearContents()
+        self.twAlunos.setRowCount(0)
+        try:
+            self.cursor.execute("SELECT nome FROM usuarios WHERE tipo_usuario = 'Aluno' ORDER BY nome ASC")
+            alunos = self.cursor.fetchall()
+            if self.twAlunos.columnCount() == 0:
+                self.twAlunos.setColumnCount(1)
+                self.twAlunos.setHorizontalHeaderLabels(['Nome'])
+            nomes_unicos = set()
+            for nome_tuple in alunos:
+                nome = nome_tuple[0]
+                if nome and nome not in nomes_unicos:
+                    nomes_unicos.add(nome)
+                    row = self.twAlunos.rowCount()
+                    self.twAlunos.insertRow(row)
+                    self.twAlunos.setItem(row, 0, QtWidgets.QTableWidgetItem(nome))
+        except Exception as e:
+            print(f"Erro ao carregar alunos: {str(e)}")
+
+    def salvar_escala(self):
+        import database
+
+        # Inicializa a variável para verificar se os dados foram salvos
+        dados_salvos = False
+
+        meses = [
+            ("Janeiro", self.twJaneiro),
+            ("Fevereiro", self.twFevereiro),
+            ("Março", self.twMarco),
+            ("Abril", self.twAbril),
+            ("Maio", self.twMaio),
+            ("Junho", self.twJunho),
+            ("Julho", self.twJulho),
+            ("Agosto", self.twAgosto),
+            ("Setembro", self.twSetembro),
+            ("Outubro", self.twOutubro),
+            ("Novembro", self.twNovembro),
+            ("Dezembro", self.twDezembro),
+        ]
+
+        # Cria a tabela 'escala' se não existir
+        database.criar_tabela_escala(self.local_db_path)
+
+        # Verifica se o modo de edição está ativado
+        if not self.modo_edicao:
+            QMessageBox.warning(self, "Aviso", "Outra instância do programa está editando o banco de dados. Tente novamente mais tarde.")
+            return
+
+        # Inicia uma única transação para todas as operações
+        try:
+            conn = database.conectar_banco(self.local_db_path, self.modo_edicao)
+            cursor = conn.cursor()
+
+            # Limpa a tabela 'escala'
+            query_limpeza = "DELETE FROM escala"
+            cursor.execute(query_limpeza)
+
+            # Coleta todas as inserções
+            for mes, table_widget in meses:
+                for row in range(4):
+                    nome_professor = table_widget.item(row, 0).text() if table_widget.item(row, 0) else None
+
+                    if nome_professor:
+                        final_de_semana = row + 1
+                        query = """
+                        INSERT INTO escala (mes, final_de_semana, professor)
+                        VALUES (?, ?, ?)
+                        """
+                        params = (mes, final_de_semana, nome_professor)
+                        cursor.execute(query, params)
+                        dados_salvos = True
+
+            # Faz o commit de todas as alterações de uma vez
+            conn.commit()
+            print("Alterações commitadas no banco local (em uma única transação).")
+
+        except Exception as e:
+            print(f"Erro ao salvar escala: {str(e)}")
+            raise
+        finally:
+            conn.close()
+
+        if dados_salvos:
+            QMessageBox.information(self, "Sucesso", "Todos os dados foram salvos!")
+        else:
+            QMessageBox.information(self, "Atenção", "Os dados não foram salvos. Favor tentar novamente!")
+
+    
+    def carregar_escala(self):
+        from PySide6.QtWidgets import QTableWidgetItem, QHeaderView, QMessageBox, QTableWidget
+        from PySide6.QtCore import Qt
+
+        try:
+            # Log para verificar o modo de edição
+            print(f"Modo edição ao carregar escala: {self.modo_edicao}")
+
+            # Dicionário para mapear meses às tabelas
+            meses_tabelas = {
+                "Janeiro": self.twJaneiro,
+                "Fevereiro": self.twFevereiro,
+                "Março": self.twMarco,
+                "Abril": self.twAbril,
+                "Maio": self.twMaio,
+                "Junho": self.twJunho,
+                "Julho": self.twJulho,
+                "Agosto": self.twAgosto,
+                "Setembro": self.twSetembro,
+                "Outubro": self.twOutubro,
+                "Novembro": self.twNovembro,
+                "Dezembro": self.twDezembro,
+            }
+
+            # Limpa o conteúdo de todas as tabelas e define número de linhas
+            for table_widget in meses_tabelas.values():
+                table_widget.clearContents()
+                table_widget.setRowCount(0)  # Resetar linhas para evitar sobras
+
+            # Usa a conexão gerenciada (self.conn) para executar a consulta
+            self.cursor.execute("SELECT mes, final_de_semana, professor FROM escala")
+            escalas = self.cursor.fetchall()
+
+            # Determinar o número de linhas necessárias por tabela
+            MINIMUM_ROWS = 5  # Número mínimo de linhas para cada tabela
+            for mes in meses_tabelas:
+                finais_de_semana = [int(e[1]) for e in escalas if e[0] == mes]
+                if finais_de_semana:
+                    max_row = max(finais_de_semana)  # Maior índice de final de semana
+                    # Definir o número de linhas como o maior entre max_row e MINIMUM_ROWS
+                    meses_tabelas[mes].setRowCount(max(max_row, MINIMUM_ROWS))
+                else:
+                    # Se não houver dados, definir o número mínimo de linhas
+                    meses_tabelas[mes].setRowCount(MINIMUM_ROWS)
+
+            # Preenche as tabelas com os dados da escala
+            for mes, final_de_semana, professor in escalas:
+                if mes in meses_tabelas:
+                    table_widget = meses_tabelas[mes]
+                    row = int(final_de_semana) - 1  # Índice baseado em 1 para 0
+                    item = QTableWidgetItem(professor)
+                    item.setData(Qt.ItemDataRole.DisplayRole, professor)
+                    # Garantir que o item seja editável
+                    item.setFlags(item.flags() | Qt.ItemIsEditable)
+                    table_widget.setItem(row, 0, item)
+
+            # Ajusta todas as tabelas e configura a editabilidade
+            for table_widget in meses_tabelas.values():
+                table_widget.setWordWrap(True)
+                table_widget.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+                table_widget.resizeRowsToContents()
+                # Configurar a tabela para ser editável se estiver em modo de edição
+                if self.modo_edicao:
+                    table_widget.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
+                else:
+                    table_widget.setEditTriggers(QTableWidget.NoEditTriggers)
+
+            # Exibe mensagem de sucesso ou aviso
+            if escalas:
+                QMessageBox.information(self, "Sucesso", "Dados importados com sucesso!")
+            else:
+                QMessageBox.information(self, "ATENÇÃO", "Nenhum dado foi encontrado/importado!")
+
+        except Exception as e:
+            # Exibe mensagem de erro em caso de falha
+            QMessageBox.critical(self, "Erro", f"Erro ao carregar escala: {str(e)}")
+
+
+
+   
+    def carregar_dados_do_csv(self):
+        import csv
+        from dropbox import Dropbox
+        from dropbox.exceptions import ApiError
+        """
+        Carrega os dados do agendamento.csv do Dropbox e preenche as tabelas na interface.
+        """
+        try:
+            # Configuração do token e caminho do arquivo no Dropbox
+            #ACCESS_TOKEN = "sl.u.AFnAQ4L6W7HOndvEwuD3oNmz3vYUmJo9SGus7G2rJtIQDr_OlyiqTOd148NLSI7Q_wkLiWw9dcAbEo_dStuU1OXw87Sk6QXYyJdwO-GpfhXavHjE_gRzGoWr08oWOFA1kRn2Go2R4bsV0ZR5a8hl_SPXx1DIjQ17avkeR8QNOZo_SWforYXBLP-bEgbNGseVarZ26bFzStcuQNngJCZOYChtv4s-TtkVc3rEdVP7Kgq7iapidOgeySc9bh09n2Nu2UGClE3_Y7F2a4NBi7UHI3i-qGuTzIxRnU-OtLITP-C-v8nzXOIUlM-SgQ89mpnO-alpRboiWbW8WM3JMoOxG4k9148C_j-Hvo11unaFNN2wfZkVRb7l_G2xZ08rl-7MESNWpSbPNctV3fzC20mb-1bKN9QnGTwepQOTcboEkLkkdAMYW6wQYNlnF5FdMEb5KGQd5voQm6ePLmH6PHZeplS1CMTluiC7h9bojIAgw1aO6iLlh2giW_7xsiGFV5h3TEouh9mh-_FkS0mifn4Zog853Qbms2OZNpLEPry3yZckBCwPhApKs-qrM50ehnWtNDDlHnfLB91TKE7MKneSUD7v_1RwP5xXCluijt08OojwGil2dXyeNg5OjkWWrVzZYIp8B9Z0ybLcW_rc8fitmfS34qMoJ5Iz_z4QCkqZZ0XzgLB6_u5ELfJc33hs5tlPm7svuYJ9nn1Jmus4wBKsEiiJ5fQe4XmnzbKedgrIw3hZWP78FA9dwKE23iFgWv7yPBLfC-mTLr3k4ea2EcNqZQBimYfgQPaqDj5HVRDkJY4LWkCvjkRTUFUWIFC80TYsySoAlmetAZqrKfhKmRKOuFFWl7hsGsJYcfLrXdrpA1l2rgnxhC2rZEhxffnvNPmOVf5vRfgNu0U0wzYCGlUR_saFRP4ZUi0h9r_UkN4k1ebusWTaWxK4veMvNYGTd_a79n9n0noEgbHY8puvPduQt7nDZXc6W5zYecV9wt9lzJT0o1kpbvsaGKS-GDx6f3NfYS_teOELBhdEH90FuXonZP5J2HwmSK2ocx3e3vtcf-DfxM6eXvuyq3UpKmT2olsI4N2NeEhDJnc-OZaZXl_NnhVkkRNzbQmfrVGszqMCkUHIwahENWfpQTn4o8LxikpivHbujoRRONB5cfPzHnSLNHlj_vQttb9yl-Qm33759EziOSei3AFbqepdnqGjmykS8lZq0r2DNle_VyUqHvwyx5RTLhzz2DoFq_rIAbGkr-nLVa4c2r__5Jg0UQHHeCIdsJYobR65d_8Ry9DGtMCmVFNe"
+            DB_DROPBOX_PATH = "/Aplicativos/NoLimitsApp/agendamento.csv"
+            LOCAL_CSV_PATH = "midia/agendamento.csv"
+
+            # Inicializar cliente Dropbox
+            dbx = obter_cliente_dropbox()
+            if dbx is None:
+                raise Exception("Falha ao inicializar o cliente Dropbox. Verifique as credenciais.")
+            
+            # Baixa o arquivo CSV do Dropbox
+            dbx.files_download_to_file(LOCAL_CSV_PATH, DB_DROPBOX_PATH)
+            print(f"Arquivo '{DB_DROPBOX_PATH}' baixado do Dropbox para '{LOCAL_CSV_PATH}'.")
+
+            # Processa o arquivo CSV localmente
+            with open(LOCAL_CSV_PATH, mode="r", newline="", encoding="utf-8") as file:
+                reader = csv.reader(file)
+                agendamentos = {}
+                for row in reader:
+                    if len(row) == 5:
+                        data, horario, aluno, prescricao, observacao = row
+                        if data not in agendamentos:
+                            agendamentos[data] = {}
+                        if horario not in agendamentos[data]:
+                            agendamentos[data][horario] = []
+
+                        agendamentos[data][horario].append((aluno, prescricao, observacao))
+                    else:
+                        print(f"Linha ignorada por formato inválido: {row}")
+
+            # Limpa as tabelas antes de preenchê-las
+            tab_widget_principal = self.tabWidget
+            for indice_dia in range(tab_widget_principal.count()):
+                dia_ativo = tab_widget_principal.widget(indice_dia)
+                tab_turnos = dia_ativo.findChild(QtWidgets.QTabWidget)
+                if tab_turnos:
+                    for indice_turno in range(tab_turnos.count()):
+                        turno_ativo = tab_turnos.widget(indice_turno)
+                        tabela_turno = turno_ativo.findChild(QtWidgets.QTableWidget)
+                        if tabela_turno:
+                            tabela_turno.clearContents()
+                            tabela_turno.setRowCount(0)
+
+            # Preenche as tabelas com os dados do CSV
+            for data, horarios in agendamentos.items():
+                data_qdate = QDate.fromString(data, "yyyy-MM-dd")
+                indice_dia = data_qdate.dayOfWeek() - 1
+                if 0 <= indice_dia <= 5:
+                    dia_ativo = tab_widget_principal.widget(indice_dia)
+                    tab_turnos = dia_ativo.findChild(QtWidgets.QTabWidget)
+                    if tab_turnos:
+                        for horario, entradas in horarios.items():
+                            turno = "Manhã" if QTime(6, 0) <= QTime.fromString(horario, "hh:mm") <= QTime(12, 0) else "Tarde"
+                            turno_index = 0 if turno == "Manhã" else 1
+                            turno_ativo = tab_turnos.widget(turno_index)
+                            tabela_turno = turno_ativo.findChild(QtWidgets.QTableWidget)
+                            if tabela_turno:
+                                if tabela_turno.columnCount() != 4:
+                                    tabela_turno.setColumnCount(4)
+                                    tabela_turno.setHorizontalHeaderLabels(["Alunos", "Prescrição", "Observação", "Check-in"])
+                                for aluno, prescricao, observacao in entradas:
+                                    row = tabela_turno.rowCount()
+                                    tabela_turno.insertRow(row)
+                                    tabela_turno.setItem(row, 0, QtWidgets.QTableWidgetItem(aluno))
+                                    tabela_turno.setItem(row, 1, QtWidgets.QTableWidgetItem(prescricao))
+                                    tabela_turno.setItem(row, 2, QtWidgets.QTableWidgetItem(observacao))
+                                    tabela_turno.setItem(row, 3, QtWidgets.QTableWidgetItem("Ausente"))
+
+            print("Dados do agendamento.csv carregados na tabWidget com sucesso.")
+        except ApiError as e:
+            print(f"Erro ao interagir com o Dropbox: {e}")
+        except FileNotFoundError:
+            print(f"Erro: O arquivo '{LOCAL_CSV_PATH}' não foi encontrado localmente após o download.")
+        except Exception as e:
+            print(f"Erro ao carregar agendamentos do CSV: {e}")
+
+    def abrir_agendamento(self):
+        data_selecionada = self.calendarWidget.selectedDate().toString("yyyy-MM-dd")
+        print(f"Data selecionada: {data_selecionada}")
+
+        data_qdate = QDate.fromString(data_selecionada, "yyyy-MM-dd")
+        inicio_semana = data_qdate.addDays(1 - data_qdate.dayOfWeek())
+        dias_da_semana = ["Segunda-Feira", "Terça-Feira", "Quarta-Feira", "Quinta-Feira", "Sexta-Feira", "Sábado"]
+        for i in range(6):
+            dia = inicio_semana.addDays(i)
+            self.tabWidget.setTabText(i, dias_da_semana[i])
+        self.carregar_dados_do_csv()
+
+        self.janela_agendamentos = AgendamentosWindow(data_selecionada=data_selecionada, local_db_path=self.local_db_path)
+        self.janela_agendamentos.aluno_adicionado.connect(self.adicionar_aluno_na_tabela)
+        self.janela_agendamentos.aluno_removido.connect(self.remover_aluno_da_tabela)
+        self.janela_agendamentos.show()
+        
+    def atualizar_estilo_botao(self, botao_clicado):
+
+        botoes = [
+            self.btn_home, self.btn_agenda, self.btn_usuarios,
+            self.btn_cadastrar, self.btn_historico, self.btn_financeiro, self.btn_exportar, self.btn_db
+        ]
+
+        estilo_padrao = """
+            QPushButton {
+                color: rgb(106, 106, 106);
+                background-color: none;
+            }
+            QPushButton:hover {
+                background-color: rgb(0, 200, 10);
+                color:
+            }
+        """
+        
+        for botao in botoes:
+            botao.setStyleSheet(estilo_padrao)
+
+        estilo_selecionado = """
+            QPushButton {
+                color: white;
+                border-right: 5px solid rgb(0, 200, 10);
+            }
+            QPushButton:hover {
+                background-color: rgb(103, 103, 103);
+                color:
+            }
+        """
+        
+        botao_clicado.setStyleSheet(estilo_selecionado)
+
+    def mudar_pagina(self, pagina, botao_clicado):
+        """Troca a página e atualiza o estilo do botão."""
+        self.paginas.setCurrentWidget(pagina)
+        self.atualizar_estilo_botao(botao_clicado)
+        
+        if pagina == self.pg_historico:
+            self.carregar_historico()
+
+    def selecionar_arquivo(self, tipo="foto"):
+        """
+        Permite selecionar uma foto ou anexo via QFileDialog e armazena o caminho apropriado.
+        """
+        if tipo == "foto":
+            filtro = "Imagens (*.png *.jpg *.jpeg *.bmp *.gif)"
+            self.foto_selecionada = None
+        elif tipo == "anexo":
+            filtro = "Todos os Arquivos (*.*);;PDF (*.pdf);;Imagens (*.png *.jpg *.jpeg)"
+            self.arquivo_selecionado = None
+
+        caminho_arquivo, _ = QFileDialog.getOpenFileName(
+            self,
+            "Selecionar Arquivo",
+            "",
+            filtro
+        )
+        if caminho_arquivo:
+            try:
+                if os.path.exists(caminho_arquivo):
+                    if tipo == "foto":
+                        self.foto_selecionada = caminho_arquivo
+                        QtWidgets.QMessageBox.information(self, 'Sucesso', f'Foto selecionada: {self.foto_selecionada}')
+                    elif tipo == "anexo":
+                        self.arquivo_selecionado = caminho_arquivo
+                        QtWidgets.QMessageBox.information(self, 'Sucesso', f'Arquivo selecionado: {self.arquivo_selecionado}')
+                else:
+                    QtWidgets.QMessageBox.warning(self, 'Erro', 'O arquivo selecionado não existe.')
+                    if tipo == "foto":
+                        self.foto_selecionada = None
+                    elif tipo == "anexo":
+                        self.arquivo_selecionado = None
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, 'Erro', f'Erro ao carregar o arquivo: {str(e)}')
+                if tipo == "foto":
+                    self.foto_selecionada = None
+                elif tipo == "anexo":
+                    self.arquivo_selecionado = None
+        else:
+            QtWidgets.QMessageBox.warning(self, 'Atenção', 'Nenhum arquivo foi selecionado.')
+            if tipo == "foto":
+                self.foto_selecionada = None
+            elif tipo == "anexo":
+                self.arquivo_selecionado = None
+
+    def enviar_foto_usuario(self):
+        tipo_usuario = self.comboBox.currentText()
+        login = self.txt_login.text()
+        nome = self.txt_nome.text()
+
+
+        if tipo_usuario == 'Aluno':
+            identificador = nome
+        else:
+            identificador = login
+
+        if not identificador:
+            QtWidgets.QMessageBox.warning(self, 'Erro', f'Preencha o {"nome" if tipo_usuario == "Aluno" else "login"} do usuário antes de enviar a foto.')
+            return
+
+        if not hasattr(self, 'foto_selecionada') or not self.foto_selecionada:
+            QtWidgets.QMessageBox.warning(self, 'Erro', 'Nenhuma foto foi selecionada.')
+            return
+
+        try:
+
+            if os.path.exists(self.foto_selecionada):
+                with open(self.foto_selecionada, 'rb') as foto_file:
+                    foto_blob = foto_file.read()
+                print(f"Foto convertida para BLOB com sucesso: {self.foto_selecionada}")
+            else:
+                QtWidgets.QMessageBox.warning(self, 'Erro', 'O caminho da foto selecionada não existe.')
+                self.foto_selecionada = None
+                return
+
+
+            conn = database.conectar_banco(self.local_db_path, modo_edicao=True)
+            cursor = conn.cursor()
+
+
+            if tipo_usuario == 'Aluno':
+                cursor.execute("SELECT id FROM usuarios WHERE nome = ?", (identificador,))
+            else:
+                cursor.execute("SELECT id FROM usuarios WHERE login = ?", (identificador,))
+            
+            resultado = cursor.fetchone()
+
+            if resultado:
+
+                cursor.execute("UPDATE usuarios SET foto = ? WHERE id = ?", (foto_blob, resultado[0]))
+            else:
+                QtWidgets.QMessageBox.warning(self, 'Erro', 'Usuário não encontrado no banco de dados. Cadastre o usuário primeiro.')
+                conn.close()
+                return
+
+            conn.commit()
+            conn.close()
+
+            QtWidgets.QMessageBox.information(self, 'Sucesso', f'Foto enviada com sucesso para o usuário {identificador}!')
+            self.foto_selecionada = None
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, 'Erro', f'Erro ao enviar a foto: {str(e)}')
+
+    def carregar_anexos(self):
+
+        aluno_selecionado = self.listWidget.currentItem()
+        if not aluno_selecionado:
+            QtWidgets.QMessageBox.warning(self, 'Erro', 'Selecione um aluno para carregar os anexos.')
+            return
+
+        nome_aluno = aluno_selecionado.text()
+
+        try:
+
+            conn = database.conectar_banco(self.local_db_path, modo_edicao=True)
+            cursor = conn.cursor()
+
+
+            cursor.execute("SELECT id, nome_arquivo FROM anexos WHERE aluno = ?", (nome_aluno,))
+            anexos = cursor.fetchall()
+            conn.close()
+
+
+            self.listAnexos.clear()
+
+
+            if anexos:
+                for id_anexo, nome_arquivo in anexos:
+                    self.listAnexos.addItem(nome_arquivo)
+            else:
+                self.listAnexos.addItem("Nenhum anexo disponível")
+
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, 'Erro', f'Erro ao carregar anexos: {str(e)}')
+
+    def carregar_alunos_na_lista(self):
+        try:
+            self.cursor.execute("SELECT nome FROM usuarios WHERE tipo_usuario = 'Aluno' ORDER BY nome ASC")
+            alunos = self.cursor.fetchall()
+            self.listWidget.clear()
+            for aluno in alunos:
+                self.listWidget.addItem(aluno[0])
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, 'Erro', f'Erro ao carregar alunos: {str(e)}')
+
+
+    def cadastrar_usuario(self):
+        from PySide6 import QtWidgets
+        from db_lock import upload_db_to_dropbox, DB_DROPBOX_PATH
+
+        if not self.modo_edicao:
+            QtWidgets.QMessageBox.warning(self, 'Aviso', 'O aplicativo está em modo somente leitura. Cadastro não permitido.')
+            return
+
+        tipo_usuario = self.comboBox.currentText()
+        login = self.txt_login.text().strip()
+        senha = self.txt_password.text().strip()
+        nome = self.txt_nome.text().strip()
+        nascimento = self.txt_nascimento.text().strip()
+        endereco = self.txt_endereco.text().strip()
+        complemento = self.txt_complemento.text().strip()
+        cpf = self.txt_cpf.text().strip()
+        telefone = self.txt_telefone.text().strip()
+        email = self.txt_email.text().strip()
+        cref = self.txt_cref.text().strip()
+        contato_emergencia = self.txt_nome_emergencia.text().strip()
+        telefone_emergencia = self.txt_numero_emergencia.text().strip()
+        nivel = self.cmb_NIVEL.currentText().strip()
+        objetivo = self.cmb_PLAN.currentText().strip()
+        plano = self.cmb_PLANO.currentText().strip() if tipo_usuario == 'Aluno' else None
+
+        foto_binaria = None
+        if self.foto_selecionada:
+            try:
+                with open(self.foto_selecionada, 'rb') as file:
+                    foto_binaria = file.read()
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(self, 'Erro', f'Erro ao ler a foto selecionada: {str(e)}')
+                return
+
+        campos_obrigatorios = []
+
+        if tipo_usuario == 'Aluno':
+            login = None
+            senha = None
+            cref = None
+            if not nome:
+                campos_obrigatorios.append("Nome")
+            if not nascimento:
+                campos_obrigatorios.append("Nascimento")
+            if not endereco:
+                campos_obrigatorios.append("Endereço")
+            if not complemento:
+                campos_obrigatorios.append("Complemento")
+            if not cpf:
+                campos_obrigatorios.append("CPF")
+            if not telefone:
+                campos_obrigatorios.append("Telefone")
+            if not contato_emergencia:
+                campos_obrigatorios.append("Contato de Emergência")
+            if not telefone_emergencia:
+                campos_obrigatorios.append("Telefone de Emergência")
+            if not email:
+                campos_obrigatorios.append("E-mail")
+            if not foto_binaria:
+                campos_obrigatorios.append("Foto")
+            if not nivel:
+                campos_obrigatorios.append("Nível")
+            if not objetivo:
+                campos_obrigatorios.append("Objetivo")
+            if not plano:
+                campos_obrigatorios.append("Plano")
+
+        elif tipo_usuario == 'Estagiário':
+            if not login:
+                campos_obrigatorios.append("Login")
+            if not senha:
+                campos_obrigatorios.append("Senha")
+            if not nome:
+                campos_obrigatorios.append("Nome")
+            if not nascimento:
+                campos_obrigatorios.append("Nascimento")
+            if not endereco:
+                campos_obrigatorios.append("Endereço")
+            if not complemento:
+                campos_obrigatorios.append("Complemento")
+            if not cpf:
+                campos_obrigatorios.append("CPF")
+            if not telefone:
+                campos_obrigatorios.append("Telefone")
+            if not email:
+                campos_obrigatorios.append("E-mail")
+            if not contato_emergencia:
+                campos_obrigatorios.append("Contato de Emergência")
+            if not telefone_emergencia:
+                campos_obrigatorios.append("Telefone de Emergência")
+            if not foto_binaria:
+                campos_obrigatorios.append("Foto")
+
+        elif tipo_usuario == 'Administrador':
+            if not login:
+                campos_obrigatorios.append("Login")
+            if not senha:
+                campos_obrigatorios.append("Senha")
+            if not nome:
+                campos_obrigatorios.append("Nome")
+            if not nascimento:
+                campos_obrigatorios.append("Nascimento")
+            if not endereco:
+                campos_obrigatorios.append("Endereço")
+            if not complemento:
+                campos_obrigatorios.append("Complemento")
+            if not cpf:
+                campos_obrigatorios.append("CPF")
+            if not telefone:
+                campos_obrigatorios.append("Telefone")
+            if not email:
+                campos_obrigatorios.append("E-mail")
+            if not contato_emergencia:
+                campos_obrigatorios.append("Contato de Emergência")
+            if not telefone_emergencia:
+                campos_obrigatorios.append("Telefone de Emergência")
+            if not foto_binaria:
+                campos_obrigatorios.append("Foto")
+
+        elif tipo_usuario == 'Professor':
+            if not login:
+                campos_obrigatorios.append("Login")
+            if not senha:
+                campos_obrigatorios.append("Senha")
+            if not nome:
+                campos_obrigatorios.append("Nome")
+            if not nascimento:
+                campos_obrigatorios.append("Nascimento")
+            if not endereco:
+                campos_obrigatorios.append("Endereço")
+            if not complemento:
+                campos_obrigatorios.append("Complemento")
+            if not cpf:
+                campos_obrigatorios.append("CPF")
+            if not telefone:
+                campos_obrigatorios.append("Telefone")
+            if not email:
+                campos_obrigatorios.append("E-mail")
+            if not cref:
+                campos_obrigatorios.append("CREF")
+            if not contato_emergencia:
+                campos_obrigatorios.append("Contato de Emergência")
+            if not telefone_emergencia:
+                campos_obrigatorios.append("Telefone de Emergência")
+            if not foto_binaria:
+                campos_obrigatorios.append("Foto")
+        
+        if campos_obrigatorios:
+            mensagem = f"Os seguintes campos obrigatórios não foram preenchidos:\n\n- " + "\n- ".join(campos_obrigatorios)
+            QtWidgets.QMessageBox.warning(self, 'Erro', mensagem)
+            return
+
+        try:
+            # Usa self.conn e self.cursor em vez de inserir_usuario
+            self.cursor.execute('''
+                INSERT INTO usuarios (tipo_usuario, login, senha, nome, nascimento, endereco, complemento, cpf, telefone, email, cref, contato_emergencia, telefone_emergencia, foto, nivel, objetivo, plano)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (tipo_usuario, login, senha, nome, nascimento, endereco, complemento, cpf, telefone, email, cref, contato_emergencia, telefone_emergencia, foto_binaria, nivel, objetivo, plano))
+            
+            self.conn.commit()
+
+            # Sincroniza com o Dropbox se em modo edição
+            if self.modo_edicao:
+                try:
+                    upload_db_to_dropbox(self.dbx, self.local_db_path, DB_DROPBOX_PATH)
+                    print("Banco sincronizado com o Dropbox após cadastrar usuário.")
+                except Exception as e:
+                    print(f"Erro ao sincronizar com Dropbox: {str(e)}")
+
+            self.cadastro_realizado.emit()
+            
+            if tipo_usuario == 'Aluno':
+                self.carregar_alunos_na_lista()
+                self.carregar_dados_financas()
+                self.carregar_alunos()
+            elif tipo_usuario in ('Professor', 'Estagiário'):
+                self.carregar_funcionarios()
+
+            QtWidgets.QMessageBox.information(self, 'Cadastro', 'Usuário cadastrado com sucesso!')
+
+        except Exception as e:
+            self.conn.rollback()
+            QtWidgets.QMessageBox.critical(self, 'Erro', f'Erro ao cadastrar usuário: {str(e)}')
+
+        # Limpeza dos campos
+        self.txt_login.clear()
+        self.txt_password.clear()
+        self.txt_nome.clear()
+        self.txt_nascimento.clear()
+        self.txt_endereco.clear()
+        self.txt_complemento.clear()
+        self.txt_cpf.clear()
+        self.txt_telefone.clear()
+        self.txt_email.clear()
+        self.txt_cref.clear()
+        self.txt_nome_emergencia.clear()
+        self.txt_numero_emergencia.clear()
+        self.foto_selecionada = None
+
+    def mudar_para_db_control(self):
+        self.paginas.setCurrentWidget(self.pg_db)
+        self.db_pgs.setCurrentWidget(self.db_control)
+
+    def mudar_para_db_main(self):
+        self.paginas.setCurrentWidget(self.pg_db)
+        self.db_pgs.setCurrentWidget(self.db_main)
+
+        self.atualizar_estilo_botao(self.btn_db)
+
+    def mudar_para_db_usuario(self):
+        self.paginas.setCurrentWidget(self.pg_db)
+        self.db_pgs.setCurrentWidget(self.db_usuario)
+
+    def mudar_para_db_financas(self):
+        """Muda para a página de finanças no banco de dados."""
+        self.paginas.setCurrentWidget(self.pg_db)
+        self.db_pgs.setCurrentWidget(self.db_financeiro)
+
+    def on_radio_button_changed(self):
+        if self.rdFunc.isChecked():
+            self.atual_table_widget = self.twFuncionarios
+        elif self.rdAluno.isChecked():
+            self.atual_table_widget = self.twAlunos
+        elif self.rdPlan.isChecked():
+            self.atual_table_widget = self.twPlanejamentos
+        elif self.rdPres.isChecked():
+            self.atual_table_widget = self.twPrescricoes
+        elif self.rdObs.isChecked():
+            self.atual_table_widget = self.twOBS
+
+    def adicionar_a_tabela(self):
+        if hasattr(self, 'atual_table_widget'):
+            info = self.txt_info.text().strip()  # Campo genérico para entrada
+
+            if not info:
+                QtWidgets.QMessageBox.warning(self, 'Atenção', 'Preencha o campo de informação!')
+                return
+
+            # Verificar se é twFuncionarios ou twAlunos
+            redirecionar = False
+            mensagem = ""
+            if self.atual_table_widget == self.twFuncionarios:
+                redirecionar = True
+                mensagem = "O cadastro de novos funcionários deve ser feito na página de cadastro! Deseja ser redirecionado?"
+            elif self.atual_table_widget == self.twAlunos:
+                redirecionar = True
+                mensagem = "O cadastro de novos alunos deve ser feito na página de cadastro! Deseja ser redirecionado?"
+
+            if redirecionar:
+                msg = QtWidgets.QMessageBox(self)
+                msg.setWindowTitle('Atenção')
+                msg.setText(mensagem)
+                msg.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+                msg.setButtonText(QtWidgets.QMessageBox.Yes, 'Sim')
+                msg.setButtonText(QtWidgets.QMessageBox.No, 'Não')
+                resposta = msg.exec()
+
+                if resposta == QtWidgets.QMessageBox.Yes:
+                    self.mudar_para_db_usuario()  # Redireciona para a página de cadastro
+                # Se "Não" for selecionado, nada acontece (não adiciona à tabela)
+            else:
+                # Para outras tabelas (sem redirecionamento)
+                row = self.atual_table_widget.rowCount()
+                self.atual_table_widget.insertRow(row)
+                item = QtWidgets.QTableWidgetItem(info)
+                self.atual_table_widget.setItem(row, 0, item)
+
+                item.setBackground(QtGui.QColor(144, 238, 144))  # Fundo verde claro
+                self.atual_table_widget.sortItems(0, Qt.AscendingOrder)  # Ordena alfabeticamente
+
+                self.txt_info.clear()
+              #  QTimer.singleShot(2000, lambda: item.setBackground(QtGui.QColor(255, 255, 255)))
+
+    def setup_db_control(self):
+
+        self.rdFunc.clicked.connect(self.on_radio_button_changed)
+        self.rdAluno.clicked.connect(self.on_radio_button_changed)
+        self.rdPlan.clicked.connect(self.on_radio_button_changed)
+        self.rdPres.clicked.connect(self.on_radio_button_changed)
+        self.rdObs.clicked.connect(self.on_radio_button_changed)
+        
+        self.btn_add_to_db.clicked.connect(self.adicionar_a_tabela)
+        self.btn_remover_to_db.clicked.connect(self.remover_da_tabela)
+
+
+    def remover_da_tabela(self):
+        tabelas_tipos = [
+            (self.twPlanejamentos, "Planejamento"),
+            (self.twPrescricoes, "Prescrição"),
+            (self.twOBS, "Observação"),
+            (self.twAlunos, "Aluno"),
+            (self.twFuncionarios, "Funcionário")  # Nova tabela adicionada
+        ]
+
+        tabela_selecionada = None
+        tipo_registro = None
+        for tabela, tipo in tabelas_tipos:
+            selecionados = tabela.selectedItems()
+            if selecionados:
+                tabela_selecionada = tabela
+                tipo_registro = tipo
+                break
+
+        if tabela_selecionada and tipo_registro:
+            conteudo = selecionados[0].text()
+
+            msg = QtWidgets.QMessageBox(self)
+            msg.setWindowTitle('Confirmação')
+            msg.setText(f'Você deseja remover "{conteudo}" do banco de dados permanentemente?\n'
+                        'Se necessário, o dado terá que ser reinserido manualmente.')
+
+            botao_sim = msg.addButton("Sim", QtWidgets.QMessageBox.YesRole)
+            botao_nao = msg.addButton("Não", QtWidgets.QMessageBox.NoRole)
+
+            msg.setDefaultButton(botao_nao)
+
+            msg.exec()
+
+            if msg.clickedButton() == botao_sim:
+                try:
+                    conn = database.conectar_banco(self.local_db_path, modo_edicao=True)
+                    cursor = conn.cursor()
+
+                    if tipo_registro == "Aluno":
+                        cursor.execute("DELETE FROM usuarios WHERE nome = ?", (conteudo,))
+                    elif tipo_registro == "Funcionário":
+                        # Verifica se é Professor ou Estagiário e remove pelo nome
+                        cursor.execute("DELETE FROM usuarios WHERE nome = ? AND tipo_usuario IN ('Professor', 'Estagiário')", 
+                                    (conteudo,))
+                    else:
+                        cursor.execute("DELETE FROM registros WHERE tipo_registro = ? AND conteudo = ?", 
+                                    (tipo_registro, conteudo))
+
+                    conn.commit()
+                    conn.close()
+
+                    # Atualização da interface
+                    if tipo_registro in ['Aluno', 'Funcionário']:
+                        self.carregar_dados_financeiro()
+                        if tipo_registro == 'Aluno':
+                            self.carregar_alunos_na_lista()
+                        elif tipo_registro == 'Funcionário':
+                            self.carregar_funcionarios()  # Presumo que exista um método similar
+                        self.carregar_dados_financeiro()
+
+                    self.cadastro_realizado.emit()
+
+                    row = selecionados[0].row()
+                    tabela_selecionada.removeRow(row)
+
+                    QtWidgets.QMessageBox.information(self, 'Sucesso', f'Dado "{conteudo}" removido do banco de dados!')
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(self, 'Erro', f'Erro ao remover do banco: {str(e)}')
+            elif msg.clickedButton() == botao_nao:
+                QtWidgets.QMessageBox.information(self, 'Cancelado', 'Remoção cancelada pelo usuário.')
+        else:
+            QtWidgets.QMessageBox.warning(self, 'Atenção', 'Selecione um item em uma das tabelas para remover.')
+
+    def carregar_funcionarios(self):
+
+        self.twFuncionarios.clearContents()
+        self.twFuncionarios.setRowCount(0)
+
+        #print("Carregando funcionários...")
+
+        try:
+            self.cursor.execute("SELECT nome, tipo_usuario FROM usuarios ORDER BY nome ASC")
+            funcionarios = self.cursor.fetchall()
+        except Exception as e:
+            print(f"Erro ao conectar ou consultar o banco: {e}")
+            return
+
+        if self.twFuncionarios.columnCount() < 2:
+            self.twFuncionarios.setColumnCount(2)
+            self.twFuncionarios.setHorizontalHeaderLabels(['Nome', 'Função'])
+
+        funcionarios_unicos = {}  
+        for nome, tipo in funcionarios:
+            if nome and ("Professor" in tipo or tipo == "Estagiário"):
+                print(f"Processando funcionário: {nome}")
+                if nome not in funcionarios_unicos:
+                    funcionarios_unicos[nome] = "Professor" if "Professor" in tipo else tipo
+
+        for nome in sorted(funcionarios_unicos.keys()):
+            row = self.twFuncionarios.rowCount()
+            self.twFuncionarios.insertRow(row)
+            self.twFuncionarios.setItem(row, 0, QtWidgets.QTableWidgetItem(nome))
+            self.twFuncionarios.setItem(row, 1, QtWidgets.QTableWidgetItem(funcionarios_unicos[nome]))
+
+        #print(f"Funcionários únicos carregados na tabela: {list(funcionarios_unicos.items())}")
+
+    def abrir_janela_limpeza(self):
+        from PySide6.QtWidgets import QPushButton, QVBoxLayout, QListWidget, QMessageBox, QDialog
+        import sqlite3
+        from db_lock import upload_db_to_dropbox, DB_DROPBOX_PATH
+
+        """Abre a janela de seleção de tabelas para limpeza e gerencia todo o processo."""
+
+        # Verificar modo de edição
+        if not self.modo_edicao:
+            QMessageBox.warning(self, "Aviso", "Você está em modo somente leitura e não pode limpar tabelas.")
+            return
+
+        # Função para listar tabelas
+        def listar_tabelas():
+            try:
+                conn = sqlite3.connect(self.local_db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                tabelas = [row[0] for row in cursor.fetchall() if row[0] != 'sqlite_sequence']
+                conn.close()
+                print(f"Tabelas encontradas: {tabelas}")
+                return tabelas
+            except Exception as e:
+                print(f"Erro ao listar tabelas: {e}")
+                QMessageBox.critical(self, "Erro", f"Falha ao listar tabelas: {e}")
+                return []
+
+        # Função para limpar tabelas
+        def limpar_tabelas(tabelas):
+            try:
+                # Fecha a conexão existente para evitar conflitos
+                if hasattr(self, 'conn') and self.conn:
+                    self.conn.close()
+                    print("Conexão existente fechada antes da limpeza.")
+                conn = sqlite3.connect(self.local_db_path)
+                cursor = conn.cursor()
+                for tabela in tabelas:
+                    cursor.execute(f"DELETE FROM {tabela}")
+                conn.commit()
+                conn.close()
+                print(f"Tabelas {tabelas} limpas com sucesso.")
+                # Reabre a conexão principal
+                self.conn = database.conectar_banco(self.local_db_path, self.modo_edicao)
+                self.cursor = self.conn.cursor()
+                return True
+            except Exception as e:
+                print(f"Erro ao limpar tabelas: {e}")
+                QMessageBox.critical(self, "Erro", f"Falha ao limpar tabelas: {e}")
+                # Reabre a conexão em caso de erro
+                self.conn = database.conectar_banco(self.local_db_path, self.modo_edicao)
+                self.cursor = self.conn.cursor()
+                return False
+
+        # Verificar se o banco local existe
+        if not os.path.exists(self.local_db_path):
+            QMessageBox.critical(self, "Erro", f"Banco de dados local '{self.local_db_path}' não encontrado.")
+            return
+
+        # Listar tabelas
+        tabelas = listar_tabelas()
+        if not tabelas:
+            QMessageBox.information(self, "Aviso", "Nenhuma tabela encontrada no banco de dados.")
+            return
+
+        # Criar e configurar o diálogo
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Selecionar Tabelas para Limpar")
+        dialog.setGeometry(200, 200, 300, 200)
+
+        layout = QVBoxLayout()
+
+        list_widget = QListWidget()
+        list_widget.setSelectionMode(QListWidget.MultiSelection)
+        for tabela in tabelas:
+            list_widget.addItem(tabela)
+        layout.addWidget(list_widget)
+
+        # Função de confirmação e execução
+        def confirmar_limpeza():
+            tabelas_selecionadas = [item.text() for item in list_widget.selectedItems()]
+            if not tabelas_selecionadas:
+                QMessageBox.warning(self, "Aviso", "Nenhuma tabela selecionada.")
+                return
+
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Confirmação")
+            msg.setText(f"Os dados das tabelas selecionadas ({', '.join(tabelas_selecionadas)}) serão perdidos permanentemente.\nDeseja fazer um backup do banco inteiro antes?")
+            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+            msg.button(QMessageBox.Yes).setText("Sim")
+            msg.button(QMessageBox.No).setText("Não")
+            msg.button(QMessageBox.Cancel).setText("Cancelar")
+            resposta = msg.exec()
+
+            if resposta == QMessageBox.Cancel:
+                return
+            elif resposta == QMessageBox.Yes:
+                try:
+                    self.bkpDB()
+                    print("Backup realizado com sucesso antes da limpeza.")
+                except Exception as e:
+                    QMessageBox.critical(self, "Erro", f"Falha ao realizar backup: {e}")
+                    return
+
+            if limpar_tabelas(tabelas_selecionadas):
+                try:
+                    upload_db_to_dropbox(self.local_db_path, DB_DROPBOX_PATH)
+                    QMessageBox.information(self, "Sucesso", "Tabelas limpas e banco atualizado no Dropbox!")
+                    dialog.accept()
+                except Exception as e:
+                    QMessageBox.critical(self, "Erro", f"Falha ao sincronizar o banco com o Dropbox: {e}")
+
+        # Configurar o botão
+        btn_confirmar = QPushButton("Limpar Selecionadas")
+        btn_confirmar.clicked.connect(confirmar_limpeza)
+        layout.addWidget(btn_confirmar)
+
+        dialog.setLayout(layout)
+        dialog.exec()
+
+
+    def confirmar_limpeza(self, dialog, list_widget):
+        """Confirma e executa a limpeza das tabelas selecionadas."""
+        tabelas_selecionadas = [
+            item.text() for item in list_widget.selectedItems()
+        ]
+        if not tabelas_selecionadas:
+            QMessageBox.warning(self, "Aviso", "Nenhuma tabela selecionada.")
+            return
+
+        confirmacao = QMessageBox.question(
+            self,
+            "Confirmação",
+            f"Tem certeza que deseja limpar os dados das seguintes tabelas?\n{', '.join(tabelas_selecionadas)}",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if confirmacao == QMessageBox.Yes:
+            self.limpar_tabelas(tabelas_selecionadas)
+            QMessageBox.information(self, "Sucesso", "Dados das tabelas selecionadas foram limpos.")
+            dialog.accept()
+
+    def limpar_tabelas(self, tabelas_selecionadas):
+        import sqlite3
+        """Limpa os dados das tabelas selecionadas."""
+        caminho_banco = "db/nolimits_DB.db"
+        conexao = sqlite3.connect(caminho_banco)
+        cursor = conexao.cursor()
+        for tabela in tabelas_selecionadas:
+            cursor.execute(f"DELETE FROM {tabela};")
+        conexao.commit()
+        conexao.close()
+   
+    def atualizar_grafico(self, *args):
+        import sqlite3
+        from datetime import datetime, timedelta
+        import plotly.graph_objects as go
+
+
+        config = {
+            'modeBarButtonsToRemove': ['toImage'],
+            'displaylogo': False
+        }
+
+        aluno_selecionado = self.listWidget.currentItem()
+        
+        if not aluno_selecionado:
+
+            fig = go.Figure()
+            fig.update_layout(
+                title="Selecione um aluno",
+                title_x=0.5,
+                template="plotly_white",
+                height=220,
+                width=220,
+                margin=dict(l=10, r=10, t=30, b=70),
+                font=dict(size=10)
+            )
+        else:
+            nome_aluno = aluno_selecionado.text()
+            hoje = datetime.now()
+            
+
+            conn = sqlite3.connect("db/nolimits_DB.db")
+            cursor = conn.cursor()
+
+
+            inicio_semana = hoje - timedelta(days=hoje.weekday())
+            fim_semana = inicio_semana + timedelta(days=6)
+            cursor.execute("""
+                SELECT COUNT(*) 
+                FROM dados_semana 
+                WHERE aluno = ? 
+                AND check_in = 'Presente' 
+                AND data_criacao >= ? AND data_criacao <= ?
+            """, (nome_aluno, inicio_semana.date(), fim_semana.date()))
+            pres_semanal = cursor.fetchone()[0]
+            cursor.execute("""
+                SELECT COUNT(*) 
+                FROM dados_semana 
+                WHERE aluno = ? 
+                AND check_in = 'Ausente' 
+                AND data_criacao >= ? AND data_criacao <= ?
+            """, (nome_aluno, inicio_semana.date(), fim_semana.date()))
+            aus_semanal = cursor.fetchone()[0]
+
+
+            inicio_mes = hoje.replace(day=1)
+            fim_mes = (inicio_mes.replace(month=inicio_mes.month % 12 + 1) - timedelta(days=1)).date()
+            cursor.execute("""
+                SELECT COUNT(*) 
+                FROM historico_dados 
+                WHERE aluno = ? 
+                AND check_in = 'Presente' 
+                AND data_criacao >= ? AND data_criacao <= ?
+            """, (nome_aluno, inicio_mes.date(), fim_mes))
+            pres_mensal = cursor.fetchone()[0]
+            cursor.execute("""
+                SELECT COUNT(*) 
+                FROM historico_dados 
+                WHERE aluno = ? 
+                AND check_in = 'Ausente' 
+                AND data_criacao >= ? AND data_criacao <= ?
+            """, (nome_aluno, inicio_mes.date(), fim_mes))
+            aus_mensal = cursor.fetchone()[0]
+
+
+            inicio_ano = hoje.replace(month=1, day=1)
+            fim_ano = hoje.replace(month=12, day=31).date()
+            cursor.execute("""
+                SELECT COUNT(*) 
+                FROM historico_dados 
+                WHERE aluno = ? 
+                AND check_in = 'Presente' 
+                AND data_criacao >= ? AND data_criacao <= ?
+            """, (nome_aluno, inicio_ano.date(), fim_ano))
+            pres_anual = cursor.fetchone()[0]
+            cursor.execute("""
+                SELECT COUNT(*) 
+                FROM historico_dados 
+                WHERE aluno = ? 
+                AND check_in = 'Ausente' 
+                AND data_criacao >= ? AND data_criacao <= ?
+            """, (nome_aluno, inicio_ano.date(), fim_ano))
+            aus_anual = cursor.fetchone()[0]
+
+            conn.close()
+
+
+            total_semanal = 6
+            total_mensal = (hoje.replace(month=hoje.month % 12 + 1, day=1) - timedelta(days=1)).day
+            total_anual = 366 if hoje.year % 4 == 0 and (hoje.year % 100 != 0 or hoje.year % 400 == 0) else 365
+
+
+            pct_pres_semanal = (pres_semanal / total_semanal) * 100 if total_semanal > 0 else 0
+            pct_aus_semanal = (aus_semanal / total_semanal) * 100 if total_semanal > 0 else 0
+            pct_pres_mensal = (pres_mensal / total_mensal) * 100 if total_mensal > 0 else 0
+            pct_aus_mensal = (aus_mensal / total_mensal) * 100 if total_mensal > 0 else 0
+            pct_pres_anual = (pres_anual / total_anual) * 100 if total_anual > 0 else 0
+            pct_aus_anual = (aus_anual / total_anual) * 100 if total_anual > 0 else 0
+
+
+            fig = go.Figure()
+
+
+            def criar_rosca(pct_pres, pct_aus):
+                return go.Pie(
+                    values=[pct_pres, pct_aus, 100 - (pct_pres + pct_aus)],
+                    labels=["Presenças", "Ausências", "Não Registrado"],
+                    hole=0.6,
+                    marker_colors=["rgb(0, 200, 10)", "#FF4040", "#808080"],
+                    textinfo="none",
+                    hoverinfo="label+percent",
+                    showlegend=False
+                )
+
+
+            fig.add_trace(criar_rosca(pct_pres_semanal, pct_aus_semanal))
+            fig.add_trace(criar_rosca(pct_pres_mensal, pct_aus_mensal))
+            fig.add_trace(criar_rosca(pct_pres_anual, pct_aus_anual))
+
+
+            fig.update_layout(
+                title="Frequência",
+                title_x=0.5,
+                template="plotly_white",
+                height=220,
+                width=220,
+                margin=dict(l=10, r=10, t=30, b=70),
+                font=dict(size=10, color="black"),
+                paper_bgcolor="white",
+                plot_bgcolor="white",
+                annotations=[dict(
+                    text=f"{pct_pres_semanal:.1f}%\n{pct_aus_semanal:.1f}%",
+                    x=0.5, y=0.5,
+                    font_size=10,
+                    showarrow=False,
+                    font_color="black"
+                )],
+                sliders=[dict(
+                    active=0,
+                    steps=[
+                        dict(label="Semana", 
+                            method="update", 
+                            args=[{"visible": [True, False, False]}, 
+                                {"annotations": [dict(text=f"{pct_pres_semanal:.1f}%\n{pct_aus_semanal:.1f}%", x=0.5, y=0.5, font_size=10, showarrow=False, font_color="black")]}]),
+                        dict(label="Mês", 
+                            method="update", 
+                            args=[{"visible": [False, True, False]}, 
+                                {"annotations": [dict(text=f"{pct_pres_mensal:.1f}%\n{pct_aus_mensal:.1f}%", x=0.5, y=0.5, font_size=10, showarrow=False, font_color="black")]}]),
+                        dict(label="Ano", 
+                            method="update", 
+                            args=[{"visible": [False, False, True]}, 
+                                {"annotations": [dict(text=f"{pct_pres_anual:.1f}%\n{pct_aus_anual:.1f}%", x=0.5, y=0.5, font_size=10, showarrow=False, font_color="black")]}])
+                    ],
+                    currentvalue={"prefix": "", "font": {"size": 10}},
+                    pad={"t": 5, "b": 5},
+                    x=0.5,
+                    xanchor="center",
+                    y=-0.6,
+                    yanchor="bottom",
+                    font=dict(size=10)
+                )]
+            )
+
+
+            fig.data[1]["visible"] = False
+            fig.data[2]["visible"] = False
+
+
+        html = fig.to_html(include_plotlyjs="cdn", config=config)
+        self.grafico.setHtml(html)
+
+
+if __name__ == "__main__":
+    
+    app = QApplication(sys.argv)
+    QLocale.setDefault(QLocale(QLocale.Portuguese, QLocale.Brazil))
+    dbx = obter_cliente_dropbox()
+    if dbx:
+        try:
+            dbx.files_download_to_file(LOCAL_DB_PATH, DB_DROPBOX_PATH)
+            print("Banco baixado do Dropbox para local.")
+        except Exception as e:
+            print(f"Erro ao baixar banco: {e}")
+            sys.exit(1)
+    else:
+        print("Falha ao conectar ao Dropbox.")
+        sys.exit(1)
+    main_window = MainWindow(dbx, LOCAL_DB_PATH)
+    main_window.show()
+    sys.exit(app.exec())
