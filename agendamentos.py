@@ -1,0 +1,703 @@
+import sys
+import csv
+import time
+from PySide6.QtCore import Qt, QDate, QTime, QTimer, Signal, QLocale
+from PySide6.QtWidgets import (
+    QApplication,
+    QWidget,
+    QVBoxLayout,
+    QCalendarWidget,
+    QDialog,
+    QLineEdit,
+    QPushButton,
+    QLabel,
+    QMessageBox,
+    QHBoxLayout,
+    QDialogButtonBox,
+    QScrollArea,
+    QToolButton,
+    QCompleter,
+    QComboBox,
+    QTimeEdit
+)
+from PySide6.QtGui import QPixmap
+from database import listar_alunos, conectar_banco
+
+class EditarAgendamentoDialog(QDialog):
+    aluno_removido = Signal(str, str, str)
+
+    def __init__(self, local_db_path, horario, aluno, parent=None):
+        super().__init__(parent)
+        self.local_db_path = local_db_path  # Armazena o caminho do banco
+        self.setWindowTitle("Editar Agendamento")
+        self.setGeometry(200, 200, 400, 250)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f8f9fa;
+                border-radius: 8px;
+            }
+            QLineEdit {
+                border: 1px solid #ced4da;
+                border-radius: 4px;
+                padding: 8px;
+                margin-bottom: 10px;
+            }
+            QDialogButtonBox QPushButton {
+                background-color: #1a73e8;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+                margin: 0 5px;
+            }
+            QDialogButtonBox QPushButton:hover {
+                background-color: #2962ff;
+            }
+            QPushButton#remover_button {
+                background-color: #d32f2f;
+            }
+            QPushButton#remover_button:hover {
+                background-color: #b71c1c;
+            }
+        """)
+
+        self.horario = horario
+        self.aluno = aluno
+        self.parent = parent
+
+        layout = QVBoxLayout(self)
+
+        # Layout principal com foto e campos de edição
+        main_layout = QHBoxLayout()
+
+        # Layout para a foto do aluno
+        foto_layout = QVBoxLayout()
+        self.foto_label = QLabel(self)
+        self.foto_label.setAlignment(Qt.AlignCenter)
+        self.atualizar_foto(aluno)  # Carrega a foto inicial
+        foto_layout.addWidget(self.foto_label)
+
+        # Layout para os campos de edição
+        fields_layout = QVBoxLayout()
+
+        # Seletor de Alunos
+        self.cmbAluno = QComboBox(self)
+        self.cmbAluno.setEditable(True)
+        self.cmbAluno.setPlaceholderText("Selecione o aluno..")
+
+        # Carregar a lista de alunos
+        alunos = listar_alunos(self.local_db_path)  # Passa self.local_db_path
+        for aluno in alunos:
+            self.cmbAluno.addItem(aluno[1])
+
+        # Configurar o completador
+        completer = QCompleter([aluno[1] for aluno in alunos], self.cmbAluno)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self.cmbAluno.setCompleter(completer)
+
+        # Conectar o evento de mudança de seleção para atualizar a foto
+        self.cmbAluno.currentTextChanged.connect(self.atualizar_foto)
+
+        fields_layout.addWidget(self.cmbAluno)
+
+        # Campo de Horário
+        self.horario_input = QLineEdit(self)
+        self.horario_input.setText(horario)
+        self.horario_input.setPlaceholderText("Horário")
+        fields_layout.addWidget(self.horario_input)
+
+        # Botões de Salvar/Cancelar
+        button_box = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel, self)
+        save_button = button_box.button(QDialogButtonBox.Save)
+        save_button.setText("Salvar")
+        cancel_button = button_box.button(QDialogButtonBox.Cancel)
+        cancel_button.setText("Cancelar")
+        button_box.accepted.connect(self.salvar_edicao)
+        button_box.rejected.connect(self.reject)
+        fields_layout.addWidget(button_box)
+
+        # Botão de Remover
+        self.remover_button = QPushButton("Remover Agendamento", self)
+        self.remover_button.setObjectName("remover_button")
+        self.remover_button.clicked.connect(self.remover_agendamento)
+        fields_layout.addWidget(self.remover_button)
+
+        # Adicionar os layouts ao layout principal
+        main_layout.addLayout(foto_layout)
+        main_layout.addLayout(fields_layout)
+
+        # Adicionar o layout principal ao layout da janela
+        layout.addLayout(main_layout)
+
+    def atualizar_foto(self, nome_aluno):
+        # Buscar os dados do aluno selecionado
+        alunos = listar_alunos(self.local_db_path)  # Passa self.local_db_path
+        aluno_completo = next((a for a in alunos if a[1] == nome_aluno), None)
+
+        if aluno_completo:
+            _, _, foto_binaria = aluno_completo
+            if foto_binaria:
+                pixmap = QPixmap()
+                pixmap.loadFromData(foto_binaria)
+                self.foto_label.setPixmap(pixmap.scaled(200, 200, Qt.KeepAspectRatio))
+            else:
+                self.foto_label.setText("Sem foto")
+        else:
+            self.foto_label.setText("Sem foto")
+
+    def salvar_edicao(self):
+        nome_novo = self.cmbAluno.currentText()
+        horario_novo = self.horario_input.text()
+
+        if nome_novo and horario_novo:
+            data_str = self.parent.data_selecionada.toString("yyyy-MM-dd")
+            agendamentos = self.parent.agendamentos
+
+            if data_str in agendamentos:
+                if self.horario in agendamentos[data_str]:
+                    alunos_antigo_horario = agendamentos[data_str][self.horario]
+                    alunos_antigo_horario.remove(self.aluno)
+
+                    if not alunos_antigo_horario:
+                        del agendamentos[data_str][self.horario]
+
+                    if horario_novo not in agendamentos[data_str]:
+                        agendamentos[data_str][horario_novo] = []
+                    agendamentos[data_str][horario_novo].append(nome_novo)
+
+                    QMessageBox.information(
+                        self,
+                        "Agendamento Atualizado",
+                        f"Agendamento de {self.aluno} foi alterado para {nome_novo} às {horario_novo}!"
+                    )
+                    self.parent.atualizar_agendamentos()
+                    self.parent.salvar_agendamentos()
+                    self.accept()
+                else:
+                    QMessageBox.warning(self, "Erro", "Agendamento não encontrado.")
+            else:
+                QMessageBox.warning(self, "Erro", "Data de agendamento não encontrada.")
+        else:
+            QMessageBox.warning(self, "Erro", "Por favor, preencha todos os campos.")
+
+    def remover_agendamento(self):
+        data_str = self.parent.data_selecionada.toString("yyyy-MM-dd")
+        agendamentos = self.parent.agendamentos
+
+        if data_str in agendamentos:
+            if self.horario in agendamentos[data_str]:
+                alunos = agendamentos[data_str][self.horario]
+                if self.aluno in alunos:
+                    alunos.remove(self.aluno)
+
+                    if not alunos:
+                        del agendamentos[data_str][self.horario]
+
+                    if not agendamentos[data_str]:
+                        del agendamentos[data_str]
+
+                    QMessageBox.information(
+                        self,
+                        "Agendamento Removido",
+                        f"Agendamento de {self.aluno} às {self.horario} foi removido com sucesso!"
+                    )
+                    self.parent.atualizar_agendamentos()
+                    self.parent.salvar_agendamentos()
+
+                    # Emite o sinal com os dados do aluno removido
+                    self.aluno_removido.emit(self.aluno, data_str, self.horario)
+                    self.accept()
+                else:
+                    QMessageBox.warning(self, "Erro", "Aluno não encontrado no agendamento.")
+            else:
+                QMessageBox.warning(self, "Erro", "Horário não encontrado no agendamento.")
+        else:
+            QMessageBox.warning(self, "Erro", "Data de agendamento não encontrada.")
+
+
+class AgendamentosWindow(QWidget):
+    aluno_adicionado = Signal(str, str, str, str, str)
+    aluno_removido = Signal(str, str, str)
+
+    def __init__(self, local_db_path, data_selecionada=None, parent=None):
+        super().__init__(parent)
+        self.local_db_path = local_db_path  # Armazena o caminho do banco
+        self.data_selecionada = QDate.fromString(data_selecionada, "yyyy-MM-dd") if data_selecionada else QDate.currentDate()
+        self.agendamentos = self.importar_agendamentos()
+        self.initUi()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.check_and_notify)
+        self.timer.start(60000)
+        self.notificacoes_exibidas = set()
+        self.theme = "light"
+        self.original_style = None
+
+    def initUi(self):
+        self.setWindowTitle("Agendamentos")
+        self.setGeometry(100, 100, 700, 500)
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #f8f9fa;
+                font-family: 'Roboto', sans-serif;
+                color: #343a40;
+            }
+            QLabel#data_label {
+                font-size: 18px;
+                font-weight: 500;
+                margin-bottom: 20px;
+            }
+            QToolButton#calendar_button {
+                background-color: #fff;
+                border: 1px solid #ced4da;
+                border-radius: 4px;
+                padding: 5px 10px;
+                margin-left: 10px;
+            }
+            QToolButton#calendar_button:hover {
+                background-color: #e9ecef;
+            }
+            QLineEdit {
+                border: 1px solid #ced4da;
+                border-radius: 4px;
+                padding: 8px;
+                margin-bottom: 10px;
+            }
+            QPushButton {
+                background-color: #1a73e8;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+            }
+            QPushButton:hover {
+                background-color: #2962ff;
+            }
+            QScrollArea {
+                border: none;
+            }
+            QScrollArea > QWidget > QWidget {
+                background-color: #fff;
+                border-radius: 8px;
+                padding: 10px;
+            }
+        """)
+    
+        layout = QVBoxLayout(self)
+
+        # Data Selecionada
+        data_layout = QHBoxLayout()
+        self.data_label = QLabel(f"Data: {self.data_selecionada.toString('dd/MM/yyyy')}")
+        self.data_label.setObjectName("data_label")
+        data_layout.addWidget(self.data_label)
+
+        self.calendar_button = QToolButton(self)
+        self.calendar_button.setText("📅")
+        self.calendar_button.setObjectName("calendar_button")
+        self.calendar_button.clicked.connect(self.mostrar_calendario)
+        data_layout.addWidget(self.calendar_button)
+        layout.addLayout(data_layout)
+
+        # Área de Rolagem para Exibir Agendamentos
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        self.scroll_area_widget = QWidget()
+        self.horarios_layout = QVBoxLayout(self.scroll_area_widget)
+        scroll_area.setWidget(self.scroll_area_widget)
+        layout.addWidget(scroll_area)
+
+        self.exibir_agendamentos()
+
+        # Campos de Entrada
+        input_layout = QHBoxLayout()
+
+        # Seletor de Alunos com Auto-Completar
+        self.cmbAluno = QComboBox(self)
+        self.cmbAluno.setEditable(True)
+        self.cmbAluno.setPlaceholderText("Selecione o aluno..")
+
+        # Carregar a lista de alunos
+        alunos = listar_alunos(self.local_db_path)  # Passa self.local_db_path
+        for aluno in alunos:
+            self.cmbAluno.addItem(aluno[1])
+
+        # Configurar o completador
+        completer = QCompleter([aluno[1] for aluno in alunos], self.cmbAluno)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self.cmbAluno.setCompleter(completer)
+
+        input_layout.addWidget(self.cmbAluno)
+
+        # Campo de Horário
+        self.horario_input = QTimeEdit(self)
+        self.horario_input.setDisplayFormat("hh:mm")
+        self.horario_input.setTime(QTime(6, 0))
+        self.horario_input.setMinimumTime(QTime(6, 0))
+        self.horario_input.setMaximumTime(QTime(18, 0))
+        input_layout.addWidget(self.horario_input)
+
+        layout.addLayout(input_layout)
+
+        # Botões
+        button_layout = QHBoxLayout()
+        button_layout.setAlignment(Qt.AlignCenter)
+
+        self.adicionar_button = QPushButton("Adicionar Agendamento", self)
+        self.adicionar_button.clicked.connect(self.abrir_confirmacao_agendamento)
+        button_layout.addWidget(self.adicionar_button)
+
+        self.theme_button = QPushButton("Alternar Tema", self)
+        self.theme_button.clicked.connect(self.toggle_theme)
+        button_layout.addWidget(self.theme_button)
+
+        layout.addLayout(button_layout)
+
+        self.setLayout(layout)
+
+    def abrir_confirmacao_agendamento(self):
+        nome = self.cmbAluno.currentText()
+        horario = self.horario_input.time().toString("hh:mm")
+
+        if nome and horario:
+            # Buscar os dados completos do aluno (incluindo foto)
+            aluno_completo = next((a for a in listar_alunos(self.local_db_path) if a[1] == nome), None)
+            if aluno_completo:
+                _, nome, foto_binaria = aluno_completo
+                self.confirmacao_dialog = ConfirmacaoAgendamentoDialog(self.local_db_path, nome, horario, foto_binaria, self)
+                
+                # Preencher os ComboBoxes com dados do banco
+                self.preencher_cmbPrescricao(self.confirmacao_dialog.cmbPrescricao)
+                self.preencher_cmbOBS(self.confirmacao_dialog.cmbOBS)
+                
+                if self.confirmacao_dialog.exec():
+                    # Após confirmação, adicionar o agendamento
+                    prescricao = self.confirmacao_dialog.cmbPrescricao.currentText()
+                    observacao = self.confirmacao_dialog.cmbOBS.currentText()
+                    self.adicionar_agendamento(nome, horario, prescricao, observacao)
+            else:
+                QMessageBox.warning(self, "Erro", "Aluno não encontrado.")
+        else:
+            QMessageBox.warning(self, "Erro", "Por favor, preencha todos os campos.")
+
+    def mostrar_calendario(self):
+        self.calendar_dialog = QDialog(self)
+        self.calendar_dialog.setWindowTitle("Selecione a Data")
+        calendar_layout = QVBoxLayout(self.calendar_dialog)
+
+        self.calendar_widget = QCalendarWidget(self.calendar_dialog)
+        self.calendar_widget.setSelectedDate(self.data_selecionada)
+        calendar_layout.addWidget(self.calendar_widget)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self.calendar_dialog)
+        ok_button = button_box.button(QDialogButtonBox.Ok)
+        ok_button.setText("OK")
+        cancel_button = button_box.button(QDialogButtonBox.Cancel)
+        cancel_button.setText("Cancelar")
+        button_box.accepted.connect(self.selecionar_data_calendario)
+        button_box.rejected.connect(self.calendar_dialog.reject)
+        calendar_layout.addWidget(button_box)
+
+        self.calendar_dialog.setLayout(calendar_layout)
+        self.calendar_dialog.exec()
+
+    def selecionar_data_calendario(self):
+        nova_data = self.calendar_widget.selectedDate()
+        self.data_selecionada = nova_data
+        self.data_label.setText(f"Data: {self.data_selecionada.toString('dd/MM/yyyy')}")
+        self.atualizar_agendamentos()
+        self.calendar_dialog.accept()
+    
+    def exibir_agendamentos(self):
+        while self.horarios_layout.count():
+            item = self.horarios_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+            elif item.layout():
+                while item.layout().count():
+                    sub_item = item.layout().takeAt(0)
+                    if sub_item.widget():
+                        sub_item.widget().deleteLater()
+                item.layout().deleteLater()
+
+        data_str = self.data_selecionada.toString("yyyy-MM-dd")
+        horarios = self.agendamentos.get(data_str, {}).items()
+        horarios = sorted(horarios, key=lambda x: x[0])
+
+        for horario, alunos in horarios:
+            horario_layout = QHBoxLayout()
+
+            horario_label = QLabel(horario)
+            horario_label.setFixedWidth(60)
+            horario_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            horario_layout.addWidget(horario_label)
+
+            for aluno in alunos:
+                aluno_button = QPushButton(aluno, self)
+                aluno_button.setStyleSheet("""
+                    QPushButton {
+                        background-color: #e8f0fe;
+                        color: #1a73e8;
+                        border: 1px solid #bbd2fc;
+                        border-radius: 15px;
+                        padding: 6px 12px;
+                        margin: 2px;
+                        text-align: center;
+                        font-size: 12px;
+                        font-weight: 500;
+                    }
+                    QPushButton:hover {
+                        background-color: #d2e3fc;
+                    }
+                """)
+                aluno_button.clicked.connect(lambda checked, h=horario, a=aluno: self.abrir_edicao_agendamento(h, a))
+                horario_layout.addWidget(aluno_button)
+
+            self.horarios_layout.addLayout(horario_layout)
+
+    def abrir_edicao_agendamento(self, horario, aluno):
+        self.editar_dialog = EditarAgendamentoDialog(self.local_db_path, horario, aluno, self)
+        self.editar_dialog.aluno_removido.connect(self.aluno_removido)
+        self.editar_dialog.exec()
+        self.atualizar_agendamentos()
+
+    def adicionar_agendamento(self, nome, horario, prescricao, observacao):
+        data_str = self.data_selecionada.toString("yyyy-MM-dd")
+        if data_str not in self.agendamentos:
+            self.agendamentos[data_str] = {}
+
+        if horario in self.agendamentos[data_str]:
+            if nome not in self.agendamentos[data_str][horario]:
+                self.agendamentos[data_str][horario].append(nome)
+            else:
+                QMessageBox.warning(self, "Aviso", "Este aluno já está agendado para este horário.")
+        else:
+            self.agendamentos[data_str][horario] = [nome]
+
+        QMessageBox.information(self, "Agendamento Adicionado", f"Agendamento de {nome} às {horario} adicionado com sucesso!")
+
+        # Armazena prescrição e observação temporariamente na instância
+        self._ultima_prescricao = prescricao
+        self._ultima_observacao = observacao
+
+        turno = "Manhã" if QTime(6, 0) <= QTime.fromString(horario, "hh:mm") <= QTime(12, 0) else "Tarde"
+        self.aluno_adicionado.emit(nome, data_str, turno, prescricao, observacao)
+
+        self.cmbAluno.setCurrentIndex(-1)
+        self.horario_input.setTime(QTime(6, 0))
+
+        self.atualizar_agendamentos()
+        self.salvar_agendamentos()
+        self.exibir_agendamentos()
+
+    def atualizar_agendamentos(self):
+        self.exibir_agendamentos()
+        self.check_and_notify()
+
+    def salvar_agendamentos(self):
+        with open("midia/agendamento.csv", mode="w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            for data, horarios in self.agendamentos.items():
+                for horario, alunos in horarios.items():
+                    for aluno in alunos:
+                        prescricao = getattr(self, '_ultima_prescricao', '')
+                        observacao = getattr(self, '_ultima_observacao', '')
+                        writer.writerow([data, horario, aluno, prescricao, observacao])
+
+    def importar_agendamentos(self):
+        agendamentos = {}
+        try:
+            with open("midia/agendamento.csv", mode="r", newline="", encoding="utf-8") as file:
+                reader = csv.reader(file)
+                for row in reader:
+                    if len(row) == 5:
+                        data, horario, aluno, prescricao, observacao = row
+                        if data not in agendamentos:
+                            agendamentos[data] = {}
+                        if horario not in agendamentos[data]:
+                            agendamentos[data][horario] = []
+                        agendamentos[data][horario].append(aluno)
+                    else:
+                        print(f"Linha ignorada por formato inválido: {row}")
+        except FileNotFoundError:
+            pass
+        return agendamentos
+
+    def check_and_notify(self):
+        now = QTime.currentTime()
+
+        data_str = self.data_selecionada.toString("yyyy-MM-dd")
+        if data_str in self.agendamentos:
+            for horario, alunos in self.agendamentos[data_str].items():
+                agendamento_time = QTime.fromString(horario, "hh:mm")
+                minutes_diff = now.secsTo(agendamento_time) / 60
+
+                if 0 < minutes_diff <= 5:
+                    agendamento_key = (data_str, horario, tuple(alunos))
+
+                    if agendamento_key not in self.notificacoes_exibidas:
+                        QMessageBox.information(
+                            self,
+                            "Lembrete de Agendamento",
+                            f"Atenção! {', '.join(alunos)} está(ão) chegando em {int(minutes_diff)} minutos para o horário das {horario}!"
+                        )
+                        self.notificacoes_exibidas.add(agendamento_key)
+
+    def toggle_theme(self):
+        if self.theme == "light":
+            self.setStyleSheet("""
+                QWidget { background-color: #343a40; color: white; }
+                QPushButton { background-color: #495057; }
+                QPushButton:hover { background-color: #6c757d; }
+                QLineEdit { border: 1px solid #6c757d; }
+                QToolButton { background-color: #212529; border-color: #495057; }
+                QToolButton:hover { background-color: #343a40; }
+                QLabel#data_label { color: white; }
+            """)
+            self.theme = "dark"
+        else:
+            self.setStyleSheet(self.original_style)
+            self.theme = "light"
+
+    def preencher_cmbPrescricao(self, combo_box):
+        try:
+            with conectar_banco(self.local_db_path, modo_edicao=False) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT conteudo FROM registros WHERE tipo_registro = 'Prescrição' ORDER BY conteudo ASC")
+                prescricoes = cursor.fetchall()
+
+            combo_box.clear()
+            for prescricao in prescricoes:
+                combo_box.addItem(prescricao[0])
+        except Exception as e:
+            print(f"Erro ao carregar prescrições: {str(e)}")
+
+    def preencher_cmbOBS(self, combo_box):
+        try:
+            with conectar_banco(self.local_db_path, modo_edicao=False) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT conteudo FROM registros WHERE tipo_registro = 'Observação' ORDER BY conteudo ASC")
+                observacoes = cursor.fetchall()
+
+            combo_box.clear()
+            for obs in observacoes:
+                combo_box.addItem(obs[0])
+        except Exception as e:
+            print(f"Erro ao carregar observações: {str(e)}")
+
+
+class ConfirmacaoAgendamentoDialog(QDialog):
+    def __init__(self, local_db_path, nome, horario, foto_binaria, parent=None):
+        super().__init__(parent)
+        self.local_db_path = local_db_path  # Armazena o caminho do banco
+        self.setWindowTitle("Confirmação de Agendamento")
+        self.setGeometry(200, 200, 400, 300)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f8f9fa;
+                border-radius: 8px;
+            }
+            QLabel {
+                margin-bottom: 10px;
+            }
+            QComboBox {
+                border: 1px solid #ced4da;
+                border-radius: 4px;
+                padding: 8px;
+                margin-bottom: 10px;
+            }
+            QPushButton {
+                background-color: #1a73e8;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+            }
+            QPushButton:hover {
+                background-color: #2962ff;
+            }
+        """)
+
+        self.nome = nome
+        self.horario = horario
+        self.foto_binaria = foto_binaria
+        self.parent = parent
+
+        layout = QVBoxLayout(self)
+
+        # Exibir a foto do aluno
+        foto_layout = QHBoxLayout()
+        self.foto_label = QLabel(self)
+        if foto_binaria:
+            pixmap = QPixmap()
+            pixmap.loadFromData(foto_binaria)
+            self.foto_label.setPixmap(pixmap.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            self.foto_label.setText("Sem foto")
+        foto_layout.addWidget(self.foto_label)
+        layout.addLayout(foto_layout)
+
+        layout.addWidget(QLabel(f"Aluno: {nome}"))
+        layout.addWidget(QLabel(f"Horário: {horario}"))
+
+        # Seletor de Prescrição
+        self.cmbPrescricao = QComboBox(self)
+        self.cmbPrescricao.setEditable(True)
+        self.cmbPrescricao.setPlaceholderText("Selecione ou digite a prescrição...")
+        layout.addWidget(self.cmbPrescricao)
+
+        # Seletor de Observações
+        self.cmbOBS = QComboBox(self)
+        self.cmbOBS.setEditable(True)
+        self.cmbOBS.setPlaceholderText("Selecione ou digite observações...")
+        layout.addWidget(self.cmbOBS)
+        
+        self.popular_combos()
+
+        # Botão de Confirmar
+        self.confirmar_button = QPushButton("Confirmar", self)
+        self.confirmar_button.clicked.connect(self.confirmar_agendamento)
+        layout.addWidget(self.confirmar_button)
+
+    def confirmar_agendamento(self):
+        prescricao = self.cmbPrescricao.currentText()
+        obs = self.cmbOBS.currentText()
+
+        if prescricao and obs:
+            QMessageBox.information(self, "Agendamento Confirmado",
+                                    f"Agendamento de {self.nome} às {self.horario} foi confirmado!\n"
+                                    f"Prescrição: {prescricao}\nObservação: {obs}")
+            self.accept()
+        else:
+            QMessageBox.warning(self, "Erro", "Por favor, preencha todos os campos.")
+
+    def popular_combos(self):
+        import sqlite3
+        try:
+            conn = sqlite3.connect(self.local_db_path)
+            cursor = conn.cursor()
+
+            # Preencher cmbPrescricao
+            self.cmbPrescricao.clear()
+            cursor.execute("SELECT conteudo FROM registros WHERE tipo_registro = 'Prescrição' ORDER BY conteudo ASC")
+            prescricoes = cursor.fetchall()
+            for pres in prescricoes:
+                self.cmbPrescricao.addItem(pres[0])
+
+            # Preencher cmbOBS
+            self.cmbOBS.clear()
+            cursor.execute("SELECT conteudo FROM registros WHERE tipo_registro = 'Observação' ORDER BY conteudo ASC")
+            observacoes = cursor.fetchall()
+            for obs in observacoes:
+                self.cmbOBS.addItem(obs[0])
+        except Exception as e:
+            print(f"Erro ao carregar dados do banco de dados: {e}")
+        finally:
+            conn.close()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    data_selecionada = QDate.currentDate().toString("yyyy-MM-dd")
+    local_db_path = "db/nolimits_DB.db"  # Ajuste o caminho conforme necessário
+    QLocale.setDefault(QLocale(QLocale.Portuguese, QLocale.Brazil))
+    window = AgendamentosWindow(local_db_path, data_selecionada)
+    window.show()
+    sys.exit(app.exec())
